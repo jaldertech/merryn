@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+*.egg-info/
+merryn-data/
+data/
+.venv/

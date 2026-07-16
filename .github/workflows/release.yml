@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: merryn-linux-x86_64
+            data-sep: ":"
+            extra: --add-binary /usr/lib/x86_64-linux-gnu/libopus.so.0:.
+          - os: windows-latest
+            name: merryn-windows-x86_64
+            data-sep: ";"
+            # discord.py's Windows wheel bundles the opus DLL; tzdata
+            # backfills the timezone database Windows lacks.
+            extra: --collect-data tzdata
+          - os: macos-latest
+            name: merryn-macos-arm64
+            data-sep: ":"
+            extra: --add-binary /opt/homebrew/opt/opus/lib/libopus.0.dylib:.
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install libopus (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopus0
+      - name: Install libopus (macOS)
+        if: runner.os == 'macOS'
+        run: brew install opus
+      - name: Install package and PyInstaller
+        run: pip install . pyinstaller
+      - name: Smoke tests
+        run: python tests/test_smoke.py
+      - name: Build binary
+        run: >
+          pyinstaller --onefile --name ${{ matrix.name }}
+          --add-data "merryn/assets${{ matrix.data-sep }}merryn/assets"
+          --collect-all discord
+          --collect-all davey
+          ${{ matrix.extra }}
+          packaging/entry.py
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
