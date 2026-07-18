@@ -27,7 +27,8 @@ from .meeting import (
     SpeakerTurn,
     now_iso,
 )
-from .minutes import build_minutes, filename_for, fmt_duration
+from .minutes import build_minutes, filename_for, fmt_duration, local_date
+from .store import BacklogItem, ContinuityStore, OpenAction
 from .views import ConfirmAdjournView, MotionView, PanelView
 
 log = logging.getLogger("merryn")
@@ -108,6 +109,7 @@ class Merryn(discord.Client):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.registry: Registry = Registry(DATA_DIR / "state.json")
+        self.continuity: ContinuityStore = ContinuityStore(DATA_DIR / "continuity.json")
         self._motion_tasks: dict[int, set[asyncio.Task]] = {}
         self._panel_bumps: dict[int, asyncio.Task] = {}
         self._open_ballots: dict[int, MotionView] = {}
@@ -118,11 +120,13 @@ class Merryn(discord.Client):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         (DATA_DIR / "minutes").mkdir(exist_ok=True)
         self.registry = Registry.load(DATA_DIR / "state.json")
+        self.continuity = ContinuityStore.load(DATA_DIR / "continuity.json")
         self.add_view(PanelView(self))
 
         self.tree.add_command(meeting_group)
         self.tree.add_command(agenda_group)
         self.tree.add_command(floor_group)
+        self.tree.add_command(actions_group)
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
             self.tree.copy_global_to(guild=guild)
@@ -151,13 +155,16 @@ class Merryn(discord.Client):
 
     def build_panel_embed(self, meeting: Meeting) -> discord.Embed:
         strict = meeting.mode == MODE_STRICT
+        description = (
+            f"Presiding: **{meeting.started_by_name}** · "
+            f"Mode: **{'strict (mute enforced)' if strict else 'advisory'}**"
+        )
+        if not meeting.persistent:
+            description = "🧪 **Test meeting** — nothing is carried forward\n" + description
         embed = discord.Embed(
             title=PANEL_TITLE,
             colour=discord.Colour.dark_red(),
-            description=(
-                f"Presiding: **{meeting.started_by_name}** · "
-                f"Mode: **{'strict (mute enforced)' if strict else 'advisory'}**"
-            ),
+            description=description,
         )
 
         item = meeting.current_agenda_item()
@@ -598,13 +605,19 @@ class Merryn(discord.Client):
         lines = [f"📜 Item {meeting.agenda_index + 1}: **{item.text}**"]
         if item.owner_id is not None:
             owner = interaction.guild.get_member(item.owner_id)
-            if owner is None or not in_meeting_voice(owner, meeting):
+            if owner is None:
                 lines.append(
-                    f"⚠️ Presenter **{item.owner_name}** is not in the meeting "
-                    "voice channel — the floor is unchanged."
+                    f"⚠️ Presenter **{item.owner_name}** could not be found — "
+                    "the floor is unchanged."
+                )
+            elif not in_meeting_voice(owner, meeting):
+                # Ping them: their item is up but they are not in the chamber.
+                lines.append(
+                    f"⚠️ {owner.mention} is due to present this item but is not "
+                    "in the voice channel — the floor is unchanged."
                 )
             elif meeting.current and meeting.current.user_id == owner.id:
-                lines.append(f"🔔 **{owner.display_name}** already has the floor.")
+                lines.append(f"🔔 {owner.mention} already has the floor.")
             else:
                 previous, current = meeting.give_floor(
                     owner.id, owner.display_name
@@ -613,7 +626,8 @@ class Merryn(discord.Client):
                 await self.strict_mute_swap(
                     meeting, interaction.guild, previous, current
                 )
-                lines.append(f"🔔 **{current.display_name}** has the floor.")
+                # Mention rather than bold-name so the presenter is notified.
+                lines.append(f"🔔 {owner.mention} — you have the floor.")
         await interaction.response.send_message("\n".join(lines))
         await self.refresh_panel(meeting)
 
@@ -626,6 +640,122 @@ class Merryn(discord.Client):
             view=ConfirmAdjournView(self),
             ephemeral=True,
         )
+
+    async def open_meeting(
+        self,
+        interaction: discord.Interaction,
+        mode_value: str,
+        agenda: str | None,
+        voice_channel: discord.VoiceChannel | None,
+        persistent: bool,
+    ) -> None:
+        """Shared body of /meeting start and /meeting test. A test meeting
+        (persistent=False) is identical live but leaves the continuity store
+        untouched — no backlog intake, no action surfacing."""
+        if not await self._require_moderator(interaction):
+            return
+        if self.registry.get(interaction.guild_id) is not None:
+            await interaction.response.send_message(
+                "A meeting is already in session. End it first.", ephemeral=True
+            )
+            return
+        if voice_channel is None:
+            voice = interaction.user.voice
+            if not voice or not voice.channel:
+                await interaction.response.send_message(
+                    "Join a voice channel or name one explicitly.", ephemeral=True
+                )
+                return
+            voice_channel = voice.channel
+
+        meeting = Meeting(
+            guild_id=interaction.guild_id,
+            text_channel_id=interaction.channel_id,
+            voice_channel_id=voice_channel.id,
+            mode=mode_value,
+            started_by_id=interaction.user.id,
+            started_by_name=interaction.user.display_name,
+            persistent=persistent,
+        )
+        if agenda:
+            for item in (part.strip() for part in agenda.split(";")):
+                if item:
+                    meeting.add_agenda_item(item)
+        # Bring the agenda backlog forward — real meetings only, so a test
+        # never drains items members are waiting to raise for real.
+        brought: list[BacklogItem] = []
+        if persistent:
+            brought = self.continuity.take_backlog(interaction.guild_id)
+            for entry in brought:
+                meeting.add_agenda_item(
+                    entry.text, owner_id=entry.owner_id, owner_name=entry.owner_name
+                )
+        for member in voice_channel.members:
+            if not member.bot:
+                meeting.record_attendance(member.id, member.display_name, "present")
+
+        self.registry.meetings[interaction.guild_id] = meeting
+        self.registry.save()
+
+        failures = 0
+        if meeting.mode == MODE_STRICT:
+            failures = await self.enforce_strict(meeting, interaction.guild)
+
+        label = "strict" if mode_value == MODE_STRICT else "advisory"
+        if persistent:
+            opened = f"Meeting opened in **{voice_channel.name}** ({label} mode)."
+        else:
+            opened = (
+                f"🧪 Test meeting opened in **{voice_channel.name}** ({label} mode) — "
+                "nothing here is carried forward."
+            )
+        await interaction.response.send_message(opened)
+
+        # Surface backlog intake and outstanding actions before the panel,
+        # so the panel stays the newest message in the channel.
+        if persistent:
+            summary = self._continuity_opening_summary(interaction.guild_id, brought)
+            if summary:
+                await interaction.channel.send(summary)
+
+        panel = await interaction.channel.send(
+            embed=self.build_panel_embed(meeting), view=PanelView(self)
+        )
+        meeting.panel_message_id = panel.id
+        self.registry.save()
+
+        if failures:
+            await interaction.followup.send(
+                f"⚠️ Could not mute {failures} member(s) — check that Merryn has the "
+                "**Mute Members** permission and a role above theirs.",
+                ephemeral=True,
+            )
+
+    def _continuity_opening_summary(
+        self, guild_id: int, brought: list[BacklogItem]
+    ) -> str | None:
+        """The public message posted at the start of a real meeting noting
+        backlog items brought forward and outstanding actions to be picked
+        up. Returns None when there is nothing to report."""
+        parts: list[str] = []
+        if brought:
+            parts.append(
+                f"📥 Brought **{len(brought)}** item(s) forward from the agenda "
+                "backlog into today's agenda."
+            )
+        actions = self.continuity.open_actions(guild_id)
+        if actions:
+            lines = ["📌 **Outstanding actions from previous meetings:**"]
+            for i, action in enumerate(actions[:20], 1):
+                lines.append(
+                    f"{i}. {action.text} — _{action.recorded_by}, "
+                    f"{local_date(action.meeting_date)}_"
+                )
+            if len(actions) > 20:
+                lines.append(f"… and {len(actions) - 20} more.")
+            lines.append("Use `/actions done <number>` once one is complete.")
+            parts.append("\n".join(lines))
+        return "\n\n".join(parts) if parts else None
 
     async def end_meeting(self, interaction: discord.Interaction) -> None:
         meeting = self.registry.meetings.pop(interaction.guild_id, None)
@@ -653,6 +783,22 @@ class Merryn(discord.Client):
         await self._stop_ballot_ambience(meeting, interaction.guild)
         await self.lift_all_mutes(meeting, interaction.guild)
         self.registry.save()
+
+        # Carry this meeting's action items into the continuity store so the
+        # next meeting opens with them. Test meetings leave no trace.
+        if meeting.persistent:
+            self.continuity.add_actions(
+                interaction.guild_id,
+                [
+                    OpenAction(
+                        text=e.text,
+                        recorded_by=e.author,
+                        meeting_date=meeting.started_at,
+                    )
+                    for e in meeting.logs
+                    if e.kind == "action"
+                ],
+            )
 
         text = build_minutes(meeting, ended_at)
         path = DATA_DIR / "minutes" / filename_for(meeting)
@@ -750,6 +896,71 @@ class Merryn(discord.Client):
                 log.warning("Voice disconnect failed: %s", exc)
         if meeting is not None:
             await self._ballot_unmute(meeting, guild)
+
+    # --- hold music for its own sake ----------------------------------------
+    # A standalone bit of fun: Merryn joins the caller's voice channel and
+    # loops the hold music, muting no one. Toggles off if he is already in
+    # voice. Refuses while a ballot is using the voice channel so it cannot
+    # tear down an in-flight vote's ambience.
+
+    async def handle_holdmusic(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        ballot = self._open_ballots.get(interaction.guild_id)
+        if ballot is not None and not ballot.is_finished():
+            await interaction.response.send_message(
+                "A ballot is open — the hold music is already playing for that.",
+                ephemeral=True,
+            )
+            return
+        # Already in voice (from an earlier /holdmusic): toggle off.
+        if guild.voice_client is not None:
+            try:
+                await guild.voice_client.disconnect(force=True)
+            except Exception as exc:
+                log.warning("Hold music stop failed: %s", exc)
+            await interaction.response.send_message(
+                "🎵 Merryn winds down the hold music and slips out."
+            )
+            return
+        voice = interaction.user.voice
+        if not voice or not voice.channel:
+            await interaction.response.send_message(
+                "Join a voice channel first.", ephemeral=True
+            )
+            return
+        path = resolve_hold_music()
+        if not path.exists():
+            await interaction.response.send_message(
+                "The hold music file is missing.", ephemeral=True
+            )
+            return
+        if not ensure_opus():
+            await interaction.response.send_message(
+                "Voice playback is unavailable — libopus is not installed.",
+                ephemeral=True,
+            )
+            return
+        channel = voice.channel
+        try:
+            source = LoopingWAVAudio(path)
+            vc = await channel.connect(self_deaf=True)
+            vc.play(source)
+        except Exception as exc:
+            log.warning("Hold music (standalone) failed: %s", exc)
+            if guild.voice_client is not None:
+                try:
+                    await guild.voice_client.disconnect(force=True)
+                except Exception:
+                    pass
+            await interaction.response.send_message(
+                "Could not start the hold music — voice is unavailable.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            f"🎵 Merryn drifts into **{channel.name}** with a little hold music. "
+            "No one is muted — run `/holdmusic` again to send him away."
+        )
 
     # --- motions ----------------------------------------------------------
 
@@ -979,60 +1190,37 @@ async def meeting_start(
     voice_channel: discord.VoiceChannel | None = None,
 ) -> None:
     bot: Merryn = interaction.client
-    if not await bot._require_moderator(interaction):
-        return
-    if bot.registry.get(interaction.guild_id) is not None:
-        await interaction.response.send_message(
-            "A meeting is already in session. End it first.", ephemeral=True
-        )
-        return
-    if voice_channel is None:
-        voice = interaction.user.voice
-        if not voice or not voice.channel:
-            await interaction.response.send_message(
-                "Join a voice channel or name one explicitly.", ephemeral=True
-            )
-            return
-        voice_channel = voice.channel
-
-    meeting = Meeting(
-        guild_id=interaction.guild_id,
-        text_channel_id=interaction.channel_id,
-        voice_channel_id=voice_channel.id,
-        mode=mode.value,
-        started_by_id=interaction.user.id,
-        started_by_name=interaction.user.display_name,
+    await bot.open_meeting(
+        interaction, mode.value, agenda, voice_channel, persistent=True
     )
-    if agenda:
-        items = [part.strip() for part in agenda.split(";") if part.strip()]
-        for item in items:
-            meeting.add_agenda_item(item)
-    for member in voice_channel.members:
-        if not member.bot:
-            meeting.record_attendance(member.id, member.display_name, "present")
 
-    bot.registry.meetings[interaction.guild_id] = meeting
-    bot.registry.save()
 
-    failures = 0
-    if meeting.mode == MODE_STRICT:
-        failures = await bot.enforce_strict(meeting, interaction.guild)
-
-    await interaction.response.send_message(
-        f"Meeting opened in **{voice_channel.name}** ({mode.name.split(' — ')[0].lower()} mode)."
+@meeting_group.command(
+    name="test",
+    description="Start a sandbox meeting to try features — nothing is carried forward",
+)
+@app_commands.describe(
+    mode="Strict mutes everyone except the speaker; advisory only tracks the queue (default advisory)",
+    agenda="Agenda items separated by semicolons",
+    voice_channel="Meeting voice channel (defaults to the one you are in)",
+)
+@app_commands.choices(
+    mode=[
+        app_commands.Choice(name="Strict — enforce muting", value=MODE_STRICT),
+        app_commands.Choice(name="Advisory — queue only", value=MODE_ADVISORY),
+    ]
+)
+async def meeting_test(
+    interaction: discord.Interaction,
+    mode: app_commands.Choice[str] | None = None,
+    agenda: str | None = None,
+    voice_channel: discord.VoiceChannel | None = None,
+) -> None:
+    bot: Merryn = interaction.client
+    mode_value = mode.value if mode is not None else MODE_ADVISORY
+    await bot.open_meeting(
+        interaction, mode_value, agenda, voice_channel, persistent=False
     )
-    panel = await interaction.channel.send(
-        embed=bot.build_panel_embed(meeting), view=PanelView(bot)
-    )
-    meeting.panel_message_id = panel.id
-    bot.registry.save()
-
-    if failures:
-        await interaction.followup.send(
-            f"⚠️ Could not mute {failures} member(s) — check that Merryn has the "
-            "**Mute Members** permission and a role above theirs.",
-            ephemeral=True,
-        )
 
 
 @meeting_group.command(name="end", description="End the meeting and publish the minutes")
@@ -1081,7 +1269,10 @@ async def meeting_mode(
     await bot.refresh_panel(meeting)
 
 
-@agenda_group.command(name="add", description="Append an item to the agenda")
+@agenda_group.command(
+    name="add",
+    description="Add an agenda item — to the live meeting, or to the next meeting if none is in session",
+)
 @app_commands.describe(
     item="The agenda item",
     owner="Member presenting this item — given the floor automatically on /agenda next",
@@ -1092,22 +1283,47 @@ async def agenda_add(
     owner: discord.Member | None = None,
 ) -> None:
     bot: Merryn = interaction.client
-    meeting = await bot._require_meeting(interaction)
-    if meeting is None or not await bot._require_moderator(interaction):
+    item = item.strip()
+    if not item:
+        await interaction.response.send_message(
+            "An agenda item cannot be empty.", ephemeral=True
+        )
         return
     if owner is not None and owner.bot:
         await interaction.response.send_message(
             "Bots do not present agenda items.", ephemeral=True
         )
         return
+    meeting = bot.registry.get(interaction.guild_id)
+    if meeting is None:
+        # Between meetings: anyone may propose an item for the next agenda.
+        count = bot.continuity.add_backlog(
+            interaction.guild_id,
+            BacklogItem(
+                text=item,
+                submitted_by=interaction.user.display_name,
+                submitted_by_id=interaction.user.id,
+                owner_id=owner.id if owner else None,
+                owner_name=owner.display_name if owner else None,
+            ),
+        )
+        suffix = f" — to be presented by **{owner.display_name}**" if owner else ""
+        await interaction.response.send_message(
+            f"📥 Added to the next meeting's agenda: **{item}**{suffix} "
+            f"({count} item{'s' if count != 1 else ''} waiting)."
+        )
+        return
+    # A meeting is in session: only moderators may edit the live agenda.
+    if not await bot._require_moderator(interaction):
+        return
     meeting.add_agenda_item(
-        item.strip(),
+        item,
         owner_id=owner.id if owner else None,
         owner_name=owner.display_name if owner else None,
     )
     bot.registry.save()
     suffix = f" — presented by **{owner.display_name}**" if owner else ""
-    await interaction.response.send_message(f"📜 Added: **{item.strip()}**{suffix}")
+    await interaction.response.send_message(f"📜 Added: **{item}**{suffix}")
     await bot.refresh_panel(meeting)
 
 
@@ -1151,11 +1367,24 @@ async def agenda_next(interaction: discord.Interaction) -> None:
     await bot.handle_agenda_next(interaction)
 
 
-@agenda_group.command(name="show", description="Show the agenda")
+@agenda_group.command(name="show", description="Show the agenda, or the backlog between meetings")
 async def agenda_show(interaction: discord.Interaction) -> None:
     bot: Merryn = interaction.client
-    meeting = await bot._require_meeting(interaction)
+    meeting = bot.registry.get(interaction.guild_id)
     if meeting is None:
+        # No meeting: show what is queued for the next one.
+        items = bot.continuity.backlog_items(interaction.guild_id)
+        if not items:
+            await interaction.response.send_message(
+                "No meeting is in session, and the agenda backlog is empty.",
+                ephemeral=True,
+            )
+            return
+        lines = ["**Agenda backlog for the next meeting:**"]
+        for i, entry in enumerate(items, 1):
+            owner = f" · to present: **{entry.owner_name}**" if entry.owner_name else ""
+            lines.append(f"{i}. {entry.text} — _proposed by {entry.submitted_by}_{owner}")
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
         return
     if not meeting.agenda:
         await interaction.response.send_message("No agenda has been set.", ephemeral=True)
@@ -1166,6 +1395,89 @@ async def agenda_show(interaction: discord.Interaction) -> None:
         owner = f" · {item.owner_name}" if item.owner_name else ""
         lines.append(f"{marker} {i + 1}. {item.text}{owner}")
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@agenda_group.command(
+    name="drop", description="Remove an item from the next meeting's agenda backlog"
+)
+@app_commands.describe(number="Backlog item number as shown by /agenda show")
+async def agenda_drop(
+    interaction: discord.Interaction, number: app_commands.Range[int, 1, 99]
+) -> None:
+    bot: Merryn = interaction.client
+    items = bot.continuity.backlog_items(interaction.guild_id)
+    if not items:
+        await interaction.response.send_message(
+            "The agenda backlog is empty.", ephemeral=True
+        )
+        return
+    if number > len(items):
+        await interaction.response.send_message(
+            f"There is no backlog item {number}.", ephemeral=True
+        )
+        return
+    target = items[number - 1]
+    if not (
+        is_moderator(interaction.user)
+        or target.submitted_by_id == interaction.user.id
+    ):
+        await interaction.response.send_message(
+            "Only a moderator or the member who proposed it may remove a backlog item.",
+            ephemeral=True,
+        )
+        return
+    removed = bot.continuity.drop_backlog(interaction.guild_id, number - 1)
+    await interaction.response.send_message(
+        f"🗑️ Removed from the backlog: **{removed.text}**"
+    )
+
+
+actions_group = app_commands.Group(
+    name="actions",
+    description="Outstanding action items carried between meetings",
+    guild_only=True,
+)
+
+
+@actions_group.command(
+    name="list", description="Show outstanding actions from previous meetings"
+)
+async def actions_list(interaction: discord.Interaction) -> None:
+    bot: Merryn = interaction.client
+    items = bot.continuity.open_actions(interaction.guild_id)
+    if not items:
+        await interaction.response.send_message(
+            "No outstanding actions. 🎉", ephemeral=True
+        )
+        return
+    lines = ["**Outstanding actions:**"]
+    for i, action in enumerate(items, 1):
+        lines.append(
+            f"{i}. {action.text} — _{action.recorded_by}, "
+            f"{local_date(action.meeting_date)}_"
+        )
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@actions_group.command(
+    name="done", description="Mark an outstanding action as completed"
+)
+@app_commands.describe(number="Action number as shown by /actions list")
+async def actions_done(
+    interaction: discord.Interaction, number: app_commands.Range[int, 1, 999]
+) -> None:
+    bot: Merryn = interaction.client
+    if not await bot._require_moderator(interaction):
+        return
+    removed = bot.continuity.complete_action(interaction.guild_id, number - 1)
+    if removed is None:
+        await interaction.response.send_message(
+            f"There is no action {number}.", ephemeral=True
+        )
+        return
+    await interaction.response.send_message(
+        f"✅ Action completed: **{removed.text}**"
+    )
 
 
 @app_commands.command(name="note", description="Record a note in the minutes")
@@ -1243,6 +1555,16 @@ async def motivation_command(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(random.choice(MOTIVATION_QUOTES))
 
 
+@app_commands.command(
+    name="holdmusic",
+    description="Merryn joins your voice channel and plays hold music — no one is muted",
+)
+@app_commands.guild_only()
+async def holdmusic_command(interaction: discord.Interaction) -> None:
+    bot: Merryn = interaction.client
+    await bot.handle_holdmusic(interaction)
+
+
 @app_commands.command(name="motion", description="Open a timed ballot on a motion")
 @app_commands.guild_only()
 @app_commands.rename(pass_percent="pass")
@@ -1276,6 +1598,7 @@ for command in (
     timer_command,
     motion_command,
     motivation_command,
+    holdmusic_command,
 ):
     client.tree.add_command(command)
 
