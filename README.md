@@ -23,8 +23,22 @@ meetings need a firm but fair chair.
 - **Point of order** — ⚡ jumps the queue and pings the chair.
 - **Agenda** — supplied at start (`/meeting start agenda:"a; b; c"`) or
   built up with `/agenda add`; advanced with `/agenda next`. Items can
-  have a presenter; advancing to an owned item automatically gives
-  that member the floor if they are in the voice channel.
+  have a presenter; advancing to an owned item automatically gives that
+  member the floor if they are in the voice channel, and pings them if
+  they are not.
+- **Agenda backlog (between meetings)** — with no meeting in session,
+  *anyone* can `/agenda add` to propose an item for next time. The
+  backlog is listed by `/agenda show`, tidied with `/agenda drop`, and
+  pulled into the agenda automatically when the next meeting opens.
+- **Outstanding actions carry over** — action items recorded with
+  `/action` survive the meeting's close. The next meeting opens by
+  listing what is still outstanding; `/actions list` shows them at any
+  time and `/actions done <n>` ticks one off. Merryn becomes the group's
+  memory of what was promised, not just a record of one sitting.
+- **Test mode** — `/meeting test` runs a sandbox meeting that behaves
+  exactly like a real one but touches none of the cross-meeting memory:
+  it never drains the backlog, surfaces or consumes outstanding actions,
+  or leaves any behind. Ideal for trying features out.
 - **Motions and ballots** — `/motion` opens a timed Aye/Nay ballot for
   members in the voice channel. While the ballot is open only the
   number of votes cast is shown — never who voted or which way, and
@@ -38,7 +52,9 @@ meetings need a firm but fair chair.
   licence-free muzak loop ships with the bot; supply your own 48 kHz
   16-bit WAV via `HOLD_MUSIC_FILE`). Music stops and mutes are lifted
   the moment the ballot closes, restoring exactly the pre-ballot mute
-  state.
+  state. `/holdmusic` also plays it on demand outside a ballot — Merryn
+  joins your voice channel, loops the music muting no one, and leaves
+  again when you run the command a second time.
 - **Speaking timer** — `/timer 120` warns the chair when a speaker
   exceeds the limit (nobody is cut off automatically).
 - **Attendance** — who was present at the start, who joined late, who
@@ -135,14 +151,19 @@ directory Merryn is started from (see `.env.example`):
 | Command | Who | Purpose |
 |---|---|---|
 | `/meeting start mode:<strict\|advisory> [agenda] [voice_channel]` | moderator | Open a meeting |
+| `/meeting test [mode] [agenda] [voice_channel]` | moderator | Sandbox meeting; nothing is carried forward |
 | `/meeting end` | moderator | Adjourn and publish minutes |
 | `/meeting mode` | moderator | Switch strict/advisory mid-meeting |
-| `/agenda add [owner]` · `/agenda assign` · `/agenda next` · `/agenda show` | moderator (show: anyone) | Manage the agenda; owned items auto-grant the floor |
+| `/agenda add [owner]` | anyone between meetings, moderator during one | Add an item to the live agenda, or to the next meeting's backlog if none is in session |
+| `/agenda assign` · `/agenda next` | moderator | Assign a presenter; advance the agenda |
+| `/agenda show` · `/agenda drop <n>` | anyone (drop: proposer or moderator) | Show the agenda/backlog; remove a backlog item |
+| `/actions list` · `/actions done <n>` | anyone (done: moderator) | Outstanding actions carried between meetings |
 | `/floor give <member>` | moderator | Give the floor directly, bypassing the queue |
 | `/note <text>` | anyone | Record a note in the minutes |
 | `/decision <text>` · `/action <text> [assignee]` | moderator | Record decisions/actions |
 | `/timer <seconds>` | moderator | Per-speaker limit (0 = off) |
 | `/motion <text> [seconds] [pass]` | anyone in the VC | Open a timed ballot; `pass:75` requires 75% in favour |
+| `/holdmusic` | anyone | Merryn joins your voice channel and loops hold music; run again to stop |
 | `/motivation` | anyone | A random word of encouragement |
 
 "Moderator" = anyone with **Manage Server**, or the role named in
@@ -155,6 +176,10 @@ directory Merryn is started from (see `.env.example`):
   the session and never strands anyone server-muted. Members who
   disconnect while muted are unmuted the moment they next join any
   voice channel.
+- Cross-meeting memory — the agenda backlog and outstanding actions —
+  lives in `continuity.json` in the same data directory, separate from
+  live meeting state so it outlives any single sitting. Test meetings
+  never write to it.
 - A ballot open across a restart is voided rather than resumed —
   in-flight votes are held in memory only, by design: they are
   anonymous and are discarded once the ballot closes. Ballot mutes

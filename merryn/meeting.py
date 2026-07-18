@@ -123,6 +123,10 @@ class Meeting:
     started_by_name: str
     started_at: str = field(default_factory=now_iso)
     panel_message_id: int | None = None
+    # A test meeting behaves identically live but never touches the
+    # cross-meeting continuity store: it does not drain the agenda
+    # backlog, surface outstanding actions, or persist its own actions.
+    persistent: bool = True
 
     agenda: list[AgendaItem] = field(default_factory=list)
     agenda_index: int | None = None
@@ -307,6 +311,8 @@ class Meeting:
             started_by_name=data["started_by_name"],
             started_at=data["started_at"],
             panel_message_id=data.get("panel_message_id"),
+            # Legacy states (written before test meetings existed) are real.
+            persistent=data.get("persistent", True),
             # Entries persisted before agenda owners existed are bare strings.
             agenda=[
                 AgendaItem(text=e) if isinstance(e, str) else AgendaItem(**e)
