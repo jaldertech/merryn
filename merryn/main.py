@@ -25,9 +25,10 @@ from .meeting import (
     MotionRecord,
     Registry,
     SpeakerTurn,
+    iso_to_dt,
     now_iso,
 )
-from .minutes import build_minutes, filename_for, fmt_duration, local_date
+from .minutes import build_minutes, filename_for, fmt_duration, local, local_date
 from .store import BacklogItem, ContinuityStore, OpenAction
 from .views import ConfirmAdjournView, MotionView, PanelView
 
@@ -58,6 +59,17 @@ MOD_ROLE_ID = int(os.environ["MOD_ROLE_ID"]) if os.environ.get("MOD_ROLE_ID") el
 
 QUEUE_DISPLAY_CAP = 15
 PANEL_TITLE = "Meeting in session"
+
+# Optional minutes archive: when a real (non-test) meeting ends, a summary
+# embed and the full Markdown minutes are also filed to this channel (found
+# by name, or by an explicit id via MINUTES_CHANNEL_ID), so the group keeps
+# a permanent record separate from the meeting's working channel.
+MINUTES_CHANNEL_NAME = os.environ.get("MINUTES_CHANNEL_NAME", "minutes")
+MINUTES_CHANNEL_ID = (
+    int(os.environ["MINUTES_CHANNEL_ID"])
+    if os.environ.get("MINUTES_CHANNEL_ID")
+    else None
+)
 # Coalesces bursts of messages into one delete-and-repost of the panel.
 PANEL_BUMP_DELAY_SECONDS = 2.0
 
@@ -757,6 +769,100 @@ class Merryn(discord.Client):
             parts.append("\n".join(lines))
         return "\n\n".join(parts) if parts else None
 
+    def _find_minutes_channel(
+        self, guild: discord.Guild
+    ) -> discord.TextChannel | None:
+        """The archive channel for a guild's minutes, or None if absent.
+
+        An explicit id wins; otherwise the meeting's own guild is searched
+        by name, so the archive always lands in the server that met.
+        """
+        if MINUTES_CHANNEL_ID is not None:
+            channel = self.get_channel(MINUTES_CHANNEL_ID)
+            return channel if isinstance(channel, discord.TextChannel) else None
+        for channel in guild.text_channels:
+            if channel.name == MINUTES_CHANNEL_NAME:
+                return channel
+        return None
+
+    def _minutes_summary_embed(
+        self, meeting: Meeting, ended_at: str
+    ) -> discord.Embed:
+        """A deterministic digest of a concluded meeting for the archive.
+
+        Summarises only what the full Markdown minutes already record — no
+        interpretation — so the archive channel stays skimmable while the
+        attached .md remains the authoritative record.
+        """
+        duration = (
+            iso_to_dt(ended_at) - iso_to_dt(meeting.started_at)
+        ).total_seconds()
+        embed = discord.Embed(
+            title=f"Minutes — {local_date(meeting.started_at)}",
+            colour=discord.Colour.dark_gold(),
+        )
+        embed.add_field(name="Convened", value=local(meeting.started_at), inline=True)
+        embed.add_field(name="Adjourned", value=local(ended_at), inline=True)
+        embed.add_field(name="Duration", value=fmt_duration(duration), inline=True)
+        embed.add_field(name="Presiding", value=meeting.started_by_name, inline=True)
+        embed.add_field(name="Mode", value=meeting.mode, inline=True)
+
+        attendees = {
+            a.user_id for a in meeting.attendance if a.event in ("present", "join")
+        }
+        embed.add_field(name="Attendance", value=str(len(attendees)), inline=True)
+
+        if meeting.motions:
+            carried = sum(1 for m in meeting.motions if m.outcome == "carried")
+            failed = sum(1 for m in meeting.motions if m.outcome in ("failed", "tied"))
+            voided = sum(1 for m in meeting.motions if m.outcome == "void")
+            parts = [f"{carried} carried", f"{failed} failed"]
+            if voided:
+                parts.append(f"{voided} void")
+            embed.add_field(
+                name=f"Motions ({len(meeting.motions)})",
+                value=", ".join(parts),
+                inline=False,
+            )
+
+        decisions = sum(1 for e in meeting.logs if e.kind == "decision")
+        actions = sum(1 for e in meeting.logs if e.kind == "action")
+        if decisions or actions:
+            embed.add_field(
+                name="Recorded",
+                value=(
+                    f"{decisions} decision{'s' if decisions != 1 else ''}, "
+                    f"{actions} action{'s' if actions != 1 else ''}"
+                ),
+                inline=False,
+            )
+        embed.set_footer(text="Recorded by Merryn.")
+        return embed
+
+    async def _archive_minutes(
+        self, meeting: Meeting, ended_at: str, path: Path, working_channel_id: int
+    ) -> None:
+        """File a real meeting's minutes to the archive channel, if one is
+        configured. Skipped for test meetings by the caller; a duplicate is
+        suppressed when the working channel already is the archive."""
+        guild = self.get_guild(meeting.guild_id)
+        if guild is None:
+            return
+        archive = self._find_minutes_channel(guild)
+        if archive is None or archive.id == working_channel_id:
+            return
+        try:
+            await archive.send(
+                embed=self._minutes_summary_embed(meeting, ended_at),
+                file=discord.File(path, filename=path.name),
+            )
+        except discord.HTTPException:
+            log.warning(
+                "Minutes archive post failed (guild=%s, channel=%s)",
+                meeting.guild_id,
+                archive.id,
+            )
+
     async def end_meeting(self, interaction: discord.Interaction) -> None:
         meeting = self.registry.meetings.pop(interaction.guild_id, None)
         if meeting is None:
@@ -810,6 +916,13 @@ class Merryn(discord.Client):
             "Meeting adjourned. Minutes attached.",
             file=discord.File(path, filename=path.name),
         )
+
+        # File a permanent copy to the archive channel, if one exists. Test
+        # meetings leave no trace; a duplicate is suppressed when the working
+        # channel already is the archive.
+        if meeting.persistent:
+            await self._archive_minutes(meeting, ended_at, path, target.id)
+
         await interaction.followup.send("Done.", ephemeral=True)
 
         # Retire the panel so its buttons stop inviting clicks.
