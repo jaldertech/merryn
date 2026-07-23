@@ -175,6 +175,7 @@ directory Merryn is started from (see `.env.example`):
 | `MINUTES_CHANNEL_NAME` / `MINUTES_CHANNEL_ID` | no | Archive channel for minutes (name default `minutes`); unset disables the archive |
 | `HOLD_MUSIC_FILE` | no | Your own hold music: 48 kHz 16-bit WAV, mono or stereo |
 | `MERRYN_TIMEZONE` | no | Timezone for minutes, e.g. `Europe/London` (default: system local time) |
+| `MERRYN_UPDATE_CHECK` | no | Daily update-notification check (default `on`; set `off` to disable) — see [Staying up to date](#staying-up-to-date) |
 | `OPUS_LIBRARY` | no | Explicit path to libopus if it is somewhere unusual |
 
 ## Commands
@@ -228,6 +229,31 @@ directory Merryn is started from (see `.env.example`):
   hierarchy (step 4 above); failures are reported to the moderator
   rather than silently ignored.
 - One meeting per server at a time; one ballot per meeting at a time.
+
+## Staying up to date
+
+Merryn does not auto-update — a self-hosted bot should never rewrite and
+relaunch itself unattended. Instead, once a day it asks the GitHub
+Releases API whether a newer version exists and, if so, writes a line to
+the log and **DMs you (the application owner) once** with a link. It only
+ever contacts GitHub, and only reads — nothing is downloaded or run. Set
+`MERRYN_UPDATE_CHECK=off` to disable it entirely.
+
+You can also click **Watch → Custom → Releases** on the
+[repository](https://github.com/jaldertech/merryn) to have GitHub email
+you when a release is published — no bot involvement at all.
+
+When a new version is out, update the way you installed:
+
+- **Binary:** download the new `merryn-*` from
+  [Releases](https://github.com/jaldertech/merryn/releases), replace your
+  old file, and restart.
+- **pip:** `pip install --force-reinstall git+https://github.com/jaldertech/merryn`
+- **Docker:** `git pull && docker compose up -d --build`
+
+New slash commands appear automatically on restart. Your `state.json` and
+`continuity.json` are read as-is across versions, so updating is safe and
+non-destructive.
 
 ## Building from source
 
