@@ -11,6 +11,7 @@ import logging
 import os
 import random
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import discord
@@ -27,7 +28,14 @@ from .meeting import (
     SpeakerTurn,
     now_iso,
 )
-from .minutes import build_minutes, filename_for, fmt_duration, local_date
+from .minutes import (
+    build_minutes,
+    display_tz,
+    filename_for,
+    fmt_duration,
+    local_date,
+    parse_local_datetime,
+)
 from .store import BacklogItem, ContinuityStore, OpenAction
 from .views import ConfirmAdjournView, MotionView, PanelView
 
@@ -102,12 +110,64 @@ def in_meeting_voice(member: discord.Member, meeting: Meeting) -> bool:
     return bool(voice and voice.channel and voice.channel.id == meeting.voice_channel_id)
 
 
+class MerrynCommandTree(app_commands.CommandTree):
+    """Command tree that always answers, even when a command explodes.
+
+    Without this, an unhandled exception leaves Discord to show its generic
+    "The application did not respond" and the member is told nothing. On a
+    server whose operator cannot read the logs that is a dead end, so every
+    failure gets an ephemeral acknowledgement and a full traceback in the
+    log.
+    """
+
+    async def on_error(
+        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+    ) -> None:
+        original = getattr(error, "original", error)
+        command = (
+            interaction.command.qualified_name if interaction.command else "unknown"
+        )
+
+        if isinstance(error, app_commands.CheckFailure):
+            message = "You cannot use that command here."
+        elif isinstance(original, discord.Forbidden):
+            message = (
+                "❌ Discord refused that — I am missing a permission. Check my "
+                "role is high enough and that I hold the permissions listed in "
+                "the setup instructions."
+            )
+        else:
+            message = (
+                "❌ Something went wrong running that command. It has been "
+                "logged; nothing was recorded in the minutes."
+            )
+
+        log.exception(
+            "Unhandled error in /%s (guild %s, user %s): %s",
+            command,
+            interaction.guild_id,
+            getattr(interaction.user, "id", None),
+            original,
+            exc_info=original,
+        )
+
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except discord.HTTPException:
+            # The interaction token may already have expired (15 minutes) or
+            # been consumed; there is nowhere left to report to.
+            log.warning("Could not deliver error notice for /%s", command)
+
+
 class Merryn(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
         intents.members = True  # needed to see who is in the voice channel
         super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
+        self.tree = MerrynCommandTree(self)
         self.registry: Registry = Registry(DATA_DIR / "state.json")
         self.continuity: ContinuityStore = ContinuityStore(DATA_DIR / "continuity.json")
         self._motion_tasks: dict[int, set[asyncio.Task]] = {}
@@ -126,6 +186,7 @@ class Merryn(discord.Client):
         self.tree.add_command(meeting_group)
         self.tree.add_command(agenda_group)
         self.tree.add_command(floor_group)
+        self.tree.add_command(quorum_group)
         self.tree.add_command(actions_group)
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
@@ -648,10 +709,14 @@ class Merryn(discord.Client):
         agenda: str | None,
         voice_channel: discord.VoiceChannel | None,
         persistent: bool,
+        quorum: bool | None = None,
     ) -> None:
         """Shared body of /meeting start and /meeting test. A test meeting
         (persistent=False) is identical live but leaves the continuity store
-        untouched — no backlog intake, no action surfacing."""
+        untouched — no backlog intake, no action surfacing.
+
+        `quorum` overrides the guild's standing enforcement flag for this
+        sitting only; the number always comes from the standing setting."""
         if not await self._require_moderator(interaction):
             return
         if self.registry.get(interaction.guild_id) is not None:
@@ -677,6 +742,13 @@ class Merryn(discord.Client):
             started_by_name=interaction.user.display_name,
             persistent=persistent,
         )
+        # Snapshot the standing quorum at open, so a later /quorum change is
+        # an explicit act rather than silently rewriting this meeting.
+        settings = self.continuity.settings_for(interaction.guild_id)
+        meeting.quorum_enabled = (
+            quorum if quorum is not None else settings.quorum_enabled
+        )
+        meeting.quorum_size = settings.quorum_size
         if agenda:
             for item in (part.strip() for part in agenda.split(";")):
                 if item:
@@ -992,6 +1064,13 @@ class Merryn(discord.Client):
             f"Carries on {requirement}",
             f"Votes cast: **{cast} / {eligible}** (anonymous)",
         ]
+        if record.quorum_override:
+            # Declared on the ballot itself so members voting in a forced
+            # ballot know at the time, not only when the minutes appear.
+            lines.append(
+                f"⚠️ **Chair override** — the chamber is inquorate "
+                f"({record.quorum_size} required); a moderator forced this vote."
+            )
         if eligible and cast >= eligible:
             lines.append(
                 "🔨 Everyone present has voted — the chair may close the ballot early."
@@ -1006,6 +1085,7 @@ class Merryn(discord.Client):
         text: str,
         seconds: int,
         pass_threshold: int | None = None,
+        override: bool = False,
     ) -> None:
         existing = self._open_ballots.get(interaction.guild_id)
         if existing is not None and not existing.is_finished():
@@ -1014,10 +1094,43 @@ class Merryn(discord.Client):
             )
             return
 
+        present = self._eligible_voter_count(
+            interaction.guild, meeting.voice_channel_id
+        )
+        override_used = False
+        if meeting.quorum_active() and not meeting.is_quorate(present):
+            short = meeting.quorum_size - present
+            if not override:
+                await interaction.response.send_message(
+                    f"🚫 The chamber is inquorate — **{present}** present, "
+                    f"**{meeting.quorum_size}** required ({short} short). "
+                    f"No ballot may be opened.\n"
+                    f"A moderator can force this vote with `override: True`, "
+                    f"or change the requirement with `/quorum set`. Either way "
+                    f"it is recorded in the minutes.",
+                    ephemeral=True,
+                )
+                return
+            if not is_moderator(interaction.user):
+                await interaction.response.send_message(
+                    "Only a moderator may force a ballot in an inquorate chamber.",
+                    ephemeral=True,
+                )
+                return
+            override_used = True
+            meeting.add_log(
+                "procedural",
+                f"Ballot on “{text}” forced by chair override — {present} present, "
+                f"{meeting.quorum_size} required for a quorum.",
+                interaction.user.display_name,
+            )
+
         record = MotionRecord(
             text=text,
             moved_by=interaction.user.display_name,
             pass_threshold=pass_threshold,
+            quorum_size=meeting.quorum_size if meeting.quorum_active() else 0,
+            quorum_override=override_used,
         )
         meeting.motions.append(record)
         self.registry.save()
@@ -1176,6 +1289,7 @@ async def floor_give(
     mode="Strict mutes everyone except the recognised speaker; advisory only tracks the queue",
     agenda="Agenda items separated by semicolons, e.g. 'Treasury; New members; Feast planning'",
     voice_channel="Meeting voice channel (defaults to the one you are in)",
+    quorum="Enforce the quorum for this meeting (default: the server's standing setting)",
 )
 @app_commands.choices(
     mode=[
@@ -1188,10 +1302,85 @@ async def meeting_start(
     mode: app_commands.Choice[str],
     agenda: str | None = None,
     voice_channel: discord.VoiceChannel | None = None,
+    quorum: bool | None = None,
 ) -> None:
     bot: Merryn = interaction.client
     await bot.open_meeting(
-        interaction, mode.value, agenda, voice_channel, persistent=True
+        interaction, mode.value, agenda, voice_channel, persistent=True, quorum=quorum
+    )
+
+
+@meeting_group.command(
+    name="schedule", description="Put a meeting in the server's event calendar"
+)
+@app_commands.describe(
+    when="Start time — 'YYYY-MM-DD HH:MM', 'DD/MM/YYYY HH:MM', or 'HH:MM' for the next one",
+    length="Expected length in minutes (default 60)",
+    title="Event title (default 'Meeting')",
+    voice_channel="Where it will be held (defaults to the one you are in)",
+    description="Agenda or notes shown on the event",
+)
+async def meeting_schedule(
+    interaction: discord.Interaction,
+    when: str,
+    length: app_commands.Range[int, 15, 1440] = 60,
+    title: str | None = None,
+    voice_channel: discord.VoiceChannel | None = None,
+    description: str | None = None,
+) -> None:
+    bot: Merryn = interaction.client
+    if not await bot._require_moderator(interaction):
+        return
+
+    start = parse_local_datetime(when)
+    if start is None:
+        await interaction.response.send_message(
+            "I could not read that time. Use `YYYY-MM-DD HH:MM`, "
+            "`DD/MM/YYYY HH:MM`, or `HH:MM` for the next occurrence.",
+            ephemeral=True,
+        )
+        return
+    if start <= datetime.now(display_tz()):
+        await interaction.response.send_message(
+            "That time has already passed.", ephemeral=True
+        )
+        return
+    if voice_channel is None:
+        voice = interaction.user.voice
+        voice_channel = voice.channel if voice and voice.channel else None
+    if voice_channel is None:
+        await interaction.response.send_message(
+            "Join a voice channel or name one explicitly.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    try:
+        event = await interaction.guild.create_scheduled_event(
+            name=title or "Meeting",
+            start_time=start,
+            end_time=start + timedelta(minutes=length),
+            entity_type=discord.EntityType.voice,
+            channel=voice_channel,
+            privacy_level=discord.PrivacyLevel.guild_only,
+            description=description or "Scheduled by Merryn.",
+        )
+    except discord.Forbidden:
+        # Manage Events is not in Merryn's original invite URL, so an install
+        # predating this command lands here rather than on a real fault. Sent
+        # publicly to match the deferred response: mixing ephemerality after a
+        # public defer leaves the "thinking" placeholder stranded.
+        await interaction.followup.send(
+            "❌ I need the **Manage Events** permission to add this to the "
+            "server calendar. Ask an administrator to grant it to my role, or "
+            "re-invite me with an invite link that includes it (see the README)."
+        )
+        return
+
+    await interaction.followup.send(
+        f"🗓️ **{event.name}** — <t:{int(start.timestamp())}:F> in "
+        f"{voice_channel.mention}. Press *Interested* on the event to be "
+        f"reminded when it starts.\n{event.url}"
     )
 
 
@@ -1432,6 +1621,130 @@ async def agenda_drop(
     )
 
 
+quorum_group = app_commands.Group(
+    name="quorum",
+    description="Set how many members must be present for a ballot",
+    guild_only=True,
+)
+
+
+@quorum_group.command(
+    name="set", description="Set how many members must be present for a ballot"
+)
+@app_commands.describe(
+    number="Members required in the chamber; 0 removes the requirement"
+)
+async def quorum_set(
+    interaction: discord.Interaction,
+    number: app_commands.Range[int, 0, 500],
+) -> None:
+    bot: Merryn = interaction.client
+    if not await bot._require_moderator(interaction):
+        return
+    previous = bot.continuity.settings_for(interaction.guild_id).quorum_size
+    settings = bot.continuity.set_quorum_size(interaction.guild_id, number)
+
+    parts = [
+        f"⚖️ Quorum set to **{number}** member(s)."
+        if number
+        else "⚖️ Quorum requirement removed."
+    ]
+    if not settings.quorum_enabled:
+        parts.append("It is currently **disabled** — enable it with `/quorum enable`.")
+
+    # A change mid-sitting applies immediately and is minuted, because it
+    # alters the standard every later ballot is judged against.
+    meeting = bot.registry.get(interaction.guild_id)
+    if meeting is not None:
+        meeting.quorum_size = number
+        meeting.add_log(
+            "procedural",
+            f"Quorum changed from {previous} to {number} by "
+            f"{interaction.user.display_name}.",
+            interaction.user.display_name,
+        )
+        bot.registry.save()
+        parts.append("The meeting in session is updated and it is in the minutes.")
+    await interaction.response.send_message(" ".join(parts))
+
+
+@quorum_group.command(name="enable", description="Enforce the quorum on ballots")
+async def quorum_enable(interaction: discord.Interaction) -> None:
+    bot: Merryn = interaction.client
+    if not await bot._require_moderator(interaction):
+        return
+    settings = bot.continuity.set_quorum_enabled(interaction.guild_id, True)
+
+    parts = ["⚖️ Quorum is now **enforced**."]
+    if not settings.quorum_size:
+        parts.append(
+            "No number is set yet, so nothing is gated — use `/quorum set <number>`."
+        )
+    else:
+        parts.append(f"Ballots need **{settings.quorum_size}** present.")
+
+    meeting = bot.registry.get(interaction.guild_id)
+    if meeting is not None:
+        meeting.quorum_enabled = True
+        meeting.quorum_size = settings.quorum_size
+        meeting.add_log(
+            "procedural",
+            f"Quorum enforcement switched on by {interaction.user.display_name}.",
+            interaction.user.display_name,
+        )
+        bot.registry.save()
+        parts.append("This applies to the meeting in session.")
+    await interaction.response.send_message(" ".join(parts))
+
+
+@quorum_group.command(name="disable", description="Stop enforcing the quorum on ballots")
+async def quorum_disable(interaction: discord.Interaction) -> None:
+    bot: Merryn = interaction.client
+    if not await bot._require_moderator(interaction):
+        return
+    bot.continuity.set_quorum_enabled(interaction.guild_id, False)
+
+    parts = ["⚖️ Quorum is no longer enforced. The number is remembered."]
+    meeting = bot.registry.get(interaction.guild_id)
+    if meeting is not None:
+        meeting.quorum_enabled = False
+        meeting.add_log(
+            "procedural",
+            f"Quorum enforcement switched off by {interaction.user.display_name}.",
+            interaction.user.display_name,
+        )
+        bot.registry.save()
+        parts.append("This applies to the meeting in session and is in the minutes.")
+    await interaction.response.send_message(" ".join(parts))
+
+
+@quorum_group.command(name="show", description="Show the quorum and whether it is met")
+async def quorum_show(interaction: discord.Interaction) -> None:
+    bot: Merryn = interaction.client
+    settings = bot.continuity.settings_for(interaction.guild_id)
+    meeting = bot.registry.get(interaction.guild_id)
+
+    lines = [
+        f"**Standing setting:** {settings.quorum_size or 'not set'}"
+        f" · {'enforced' if settings.quorum_enabled else 'not enforced'}"
+    ]
+    if meeting is not None:
+        present = bot._eligible_voter_count(
+            interaction.guild, meeting.voice_channel_id
+        )
+        if meeting.quorum_active():
+            state = "✅ quorate" if meeting.is_quorate(present) else "🚫 inquorate"
+            lines.append(
+                f"**This meeting:** {present} present of {meeting.quorum_size} "
+                f"required — {state}"
+            )
+        else:
+            lines.append(
+                f"**This meeting:** {present} present; no quorum is being enforced."
+            )
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
 actions_group = app_commands.Group(
     name="actions",
     description="Outstanding action items carried between meetings",
@@ -1572,12 +1885,14 @@ async def holdmusic_command(interaction: discord.Interaction) -> None:
     text="The motion being put to the meeting",
     seconds="How long the ballot stays open (default 60)",
     pass_percent="Percentage of votes cast needed to carry, e.g. 75 (default: simple majority)",
+    override="Moderators only: force the ballot despite an inquorate chamber",
 )
 async def motion_command(
     interaction: discord.Interaction,
     text: str,
     seconds: app_commands.Range[int, 15, 600] = 60,
     pass_percent: app_commands.Range[int, 1, 100] | None = None,
+    override: bool = False,
 ) -> None:
     bot: Merryn = interaction.client
     meeting = await bot._require_meeting(interaction)
@@ -1588,7 +1903,111 @@ async def motion_command(
             "Join the meeting voice channel first.", ephemeral=True
         )
         return
-    await bot.open_motion(interaction, meeting, text, seconds, pass_percent)
+    await bot.open_motion(
+        interaction, meeting, text, seconds, pass_percent, override=override
+    )
+
+
+def build_help_embed(moderator: bool) -> discord.Embed:
+    """The how-to. Moderator sections are omitted for ordinary members so
+    the reply is about what the reader can actually do."""
+    embed = discord.Embed(
+        title="Merryn — how to use me",
+        description=(
+            "I moderate meetings held in a voice channel: a raise-hand "
+            "speaking queue, an agenda, timed ballots on motions, and "
+            "minutes published when the meeting ends."
+        ),
+        colour=discord.Colour.dark_gold(),
+    )
+    embed.add_field(
+        name="Taking part",
+        value=(
+            "Join the meeting's voice channel and use the panel at the bottom "
+            "of the channel.\n"
+            "✋ — raise your hand, or lower it. If you already hold the floor, "
+            "pressing it yields and reopens the floor.\n"
+            "⚡ — point of order: jumps the queue and pings the chair.\n"
+            "`/note <text>` — record something in the minutes.\n"
+            "`/agenda show` — the agenda, or the backlog between meetings."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Motions and voting",
+        value=(
+            "`/motion <text>` — open a ballot; anyone in the voice channel "
+            "may move one. Add `seconds:` for a longer ballot, or `pass:75` "
+            "to require a supermajority.\n"
+            "Votes are **anonymous** — the count is public, never who voted "
+            "or which way. One ballot at a time.\n"
+            "`/quorum show` — how many must be present, and whether that is "
+            "currently met."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Between meetings",
+        value=(
+            "`/agenda add <text>` — anyone may propose an item for the next "
+            "meeting; it pre-populates the agenda automatically.\n"
+            "`/actions list` — outstanding actions carried forward."
+        ),
+        inline=False,
+    )
+    if moderator:
+        embed.add_field(
+            name="Chairing (moderators)",
+            value=(
+                "`/meeting start mode:<strict|advisory>` — strict server-mutes "
+                "everyone but the recognised speaker; advisory only tracks the "
+                "queue. Add `agenda:\"a; b; c\"` and `quorum:` to override the "
+                "standing quorum for this meeting.\n"
+                "`/meeting schedule when:\"HH:MM\"` — add it to the server's "
+                "event calendar so members can be reminded.\n"
+                "`/meeting test` — a sandbox meeting; nothing is carried "
+                "forward. `/meeting end` publishes the minutes.\n"
+                "🔔 on the panel calls the next speaker; `/floor give` "
+                "recognises a member directly."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Quorum (moderators)",
+            value=(
+                "`/quorum set <number>` — how many members must be present for "
+                "a ballot. `/quorum enable` and `/quorum disable` turn "
+                "enforcement on and off; the number is remembered either way.\n"
+                "An inquorate chamber cannot open a ballot. A moderator may "
+                "force one with `override: True` on `/motion` — that, and any "
+                "change to the number, is written into the minutes."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="The record (moderators)",
+            value=(
+                "`/decision <text>` and `/action <text> [assignee]` — actions "
+                "survive the meeting and are raised at the next one until "
+                "`/actions done`.\n"
+                "`/timer <seconds>` warns you when a speaker runs long (nobody "
+                "is cut off). `/agenda assign` names a presenter; advancing to "
+                "their item gives them the floor and pings them."
+            ),
+            inline=False,
+        )
+    embed.set_footer(
+        text="Minutes are assembled from what I observed — nothing is inferred or invented."
+    )
+    return embed
+
+
+@app_commands.command(name="help", description="How to use Merryn")
+@app_commands.guild_only()
+async def help_command(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message(
+        embed=build_help_embed(is_moderator(interaction.user)), ephemeral=True
+    )
 
 
 for command in (
@@ -1599,6 +2018,7 @@ for command in (
     motion_command,
     motivation_command,
     holdmusic_command,
+    help_command,
 ):
     client.tree.add_command(command)
 

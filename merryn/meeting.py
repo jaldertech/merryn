@@ -85,6 +85,11 @@ class MotionRecord:
     # Members present in the chamber when the ballot closed; 0 = not
     # recorded (legacy records). Only ever a head-count, never identities.
     eligible: int = 0
+    # Quorum in force when the ballot opened; 0 = no quorum was enforced.
+    quorum_size: int = 0
+    # True when a moderator forced the ballot despite the chamber being
+    # inquorate. Recorded so the minutes never hide a forced vote.
+    quorum_override: bool = False
     at: str = field(default_factory=now_iso)
 
     def percent_in_favour(self) -> int | None:
@@ -147,6 +152,12 @@ class Meeting:
     # Members muted for the duration of an open ballot (they were not
     # already muted when it opened); unmuted when the ballot closes.
     ballot_muted_user_ids: list[int] = field(default_factory=list)
+
+    # Quorum in force for this meeting, snapshotted from the guild setting
+    # when it opened so that changing the guild default mid-meeting is an
+    # explicit act (/quorum set) rather than a silent drift.
+    quorum_enabled: bool = False
+    quorum_size: int = 0
 
     # --- queue mechanics -------------------------------------------------
 
@@ -275,6 +286,21 @@ class Meeting:
         item.owner_name = owner_name
         return item
 
+    # --- quorum -----------------------------------------------------------
+
+    def quorum_active(self) -> bool:
+        """True when a quorum is both switched on and actually set.
+
+        Enabled-but-unset (size 0) deliberately gates nothing: it means the
+        chair turned quorum on but never said what it is, and refusing every
+        ballot on that basis would be worse than not enforcing it.
+        """
+        return self.quorum_enabled and self.quorum_size > 0
+
+    def is_quorate(self, present: int) -> bool:
+        """True when `present` members satisfy the quorum in force."""
+        return not self.quorum_active() or present >= self.quorum_size
+
     # --- logging ----------------------------------------------------------
 
     def add_log(self, kind: str, text: str, author: str) -> LogEntry:
@@ -324,6 +350,9 @@ class Meeting:
             timer_alerted=data.get("timer_alerted", False),
             muted_user_ids=list(data.get("muted_user_ids", [])),
             ballot_muted_user_ids=list(data.get("ballot_muted_user_ids", [])),
+            # Meetings persisted before quorum existed ran unquorate.
+            quorum_enabled=data.get("quorum_enabled", False),
+            quorum_size=data.get("quorum_size", 0),
         )
         meeting.queue = [QueueEntry(**e) for e in data.get("queue", [])]
         current = data.get("current")

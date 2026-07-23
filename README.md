@@ -47,6 +47,24 @@ meetings need a firm but fair chair.
   in favour and how many of those present abstained by not voting.
   An optional supermajority can be required per motion:
   `/motion text:"Buy the new marquee" pass:75 seconds:120`.
+- **Quorum** — `/quorum set 8` fixes how many members must be in the
+  chamber before a ballot may be opened; `/quorum enable` and
+  `/quorum disable` switch enforcement on and off without forgetting the
+  number. An inquorate chamber cannot open a ballot. A moderator may force
+  one with `override: True` on `/motion`, and both the override and any
+  change to the number are written into the minutes under a **Procedural**
+  heading, so a forced vote can never be quietly reinterpreted later. The
+  setting is per-server and outlives meetings; `/meeting start quorum:`
+  overrides it for a single sitting, and `/quorum show` reports whether
+  the chamber is currently quorate.
+- **Scheduling** — `/meeting schedule when:"19:30"` creates a native
+  Discord scheduled event in the server's calendar, so members can mark
+  themselves interested and be reminded. Times are read in the configured
+  `MERRYN_TIMEZONE`; accepts `YYYY-MM-DD HH:MM`, `DD/MM/YYYY HH:MM`, or a
+  bare `HH:MM` for the next occurrence. **Requires the Manage Events
+  permission** (see step 3).
+- **Help** — `/help` explains how to use Merryn, privately. Moderators
+  additionally see the chairing, quorum, and record-keeping sections.
 - **Hold music** — while a ballot is open, everyone in the voice
   channel is muted and Merryn joins to play hold music (a synthesised,
   licence-free muzak loop ships with the bot; supply your own 48 kHz
@@ -118,13 +136,20 @@ docker compose up -d --build
    Intent**. (Message Content is *not* needed.)
 3. Invite it: **OAuth2 → URL Generator** → scopes `bot` +
    `applications.commands`; bot permissions **View Channels, Send
-   Messages, Embed Links, Attach Files, Mute Members, Connect, Speak**
-   (the last two are for ballot hold music). Or use this template with
-   your client ID:
+   Messages, Embed Links, Attach Files, Mute Members, Connect, Speak,
+   Manage Events** (Connect/Speak are for ballot hold music; Manage
+   Events lets `/meeting schedule` add events to the calendar). Or use
+   this template with your client ID:
 
    ```
-   https://discord.com/oauth2/authorize?client_id=YOUR_CLIENT_ID&scope=bot+applications.commands&permissions=7392256
+   https://discord.com/oauth2/authorize?client_id=YOUR_CLIENT_ID&scope=bot+applications.commands&permissions=8597326848
    ```
+
+   > **Upgrading an existing install?** Discord does not grant new
+   > permissions retroactively. If you invited Merryn before scheduling
+   > existed, `/meeting schedule` will report a missing permission until
+   > you either re-invite with the link above or grant Merryn's role
+   > **Manage Events** in Server Settings → Roles. Nothing else needs it.
 
 4. In the server, drag Merryn's role **above** the members it should
    be able to mute.
@@ -150,10 +175,14 @@ directory Merryn is started from (see `.env.example`):
 
 | Command | Who | Purpose |
 |---|---|---|
-| `/meeting start mode:<strict\|advisory> [agenda] [voice_channel]` | moderator | Open a meeting |
+| `/help` | anyone | How to use Merryn; moderators see the chairing sections too |
+| `/meeting start mode:<strict\|advisory> [agenda] [voice_channel] [quorum]` | moderator | Open a meeting |
+| `/meeting schedule when:<time> [length] [title] [voice_channel] [description]` | moderator | Add a meeting to the server's event calendar (needs Manage Events) |
 | `/meeting test [mode] [agenda] [voice_channel]` | moderator | Sandbox meeting; nothing is carried forward |
 | `/meeting end` | moderator | Adjourn and publish minutes |
 | `/meeting mode` | moderator | Switch strict/advisory mid-meeting |
+| `/quorum set <n>` · `/quorum enable` · `/quorum disable` | moderator | Members required in the chamber for a ballot; toggle enforcement |
+| `/quorum show` | anyone | The standing setting, and whether the chamber is quorate now |
 | `/agenda add [owner]` | anyone between meetings, moderator during one | Add an item to the live agenda, or to the next meeting's backlog if none is in session |
 | `/agenda assign` · `/agenda next` | moderator | Assign a presenter; advance the agenda |
 | `/agenda show` · `/agenda drop <n>` | anyone (drop: proposer or moderator) | Show the agenda/backlog; remove a backlog item |
@@ -162,7 +191,7 @@ directory Merryn is started from (see `.env.example`):
 | `/note <text>` | anyone | Record a note in the minutes |
 | `/decision <text>` · `/action <text> [assignee]` | moderator | Record decisions/actions |
 | `/timer <seconds>` | moderator | Per-speaker limit (0 = off) |
-| `/motion <text> [seconds] [pass]` | anyone in the VC | Open a timed ballot; `pass:75` requires 75% in favour |
+| `/motion <text> [seconds] [pass] [override]` | anyone in the VC | Open a timed ballot; `pass:75` requires 75% in favour; `override:` (moderators) forces an inquorate ballot |
 | `/holdmusic` | anyone | Merryn joins your voice channel and loops hold music; run again to stop |
 | `/motivation` | anyone | A random word of encouragement |
 

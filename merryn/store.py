@@ -50,13 +50,27 @@ class BacklogItem:
     at: str = field(default_factory=now_iso)
 
 
+@dataclass
+class GuildSettings:
+    """Standing configuration for a guild, independent of any meeting.
+
+    Quorum lives here rather than on Meeting so that a server sets it once
+    and every subsequent meeting inherits it; each meeting snapshots the
+    values at open so a later change never rewrites past ballots.
+    """
+
+    quorum_enabled: bool = False
+    quorum_size: int = 0
+
+
 class ContinuityStore:
-    """Per-guild open actions and agenda backlog, persisted to disk."""
+    """Per-guild open actions, agenda backlog and standing settings."""
 
     def __init__(self, path: Path):
         self.path = path
         self.actions: dict[int, list[OpenAction]] = {}
         self.backlog: dict[int, list[BacklogItem]] = {}
+        self.settings: dict[int, GuildSettings] = {}
 
     # --- actions ---------------------------------------------------------
 
@@ -113,6 +127,24 @@ class ContinuityStore:
             self.save()
         return items
 
+    # --- standing settings -----------------------------------------------
+
+    def settings_for(self, guild_id: int) -> GuildSettings:
+        """The guild's standing settings, defaulted but not yet persisted."""
+        return self.settings.get(guild_id) or GuildSettings()
+
+    def set_quorum_size(self, guild_id: int, size: int) -> GuildSettings:
+        settings = self.settings.setdefault(guild_id, GuildSettings())
+        settings.quorum_size = max(0, size)
+        self.save()
+        return settings
+
+    def set_quorum_enabled(self, guild_id: int, enabled: bool) -> GuildSettings:
+        settings = self.settings.setdefault(guild_id, GuildSettings())
+        settings.quorum_enabled = enabled
+        self.save()
+        return settings
+
     # --- persistence -----------------------------------------------------
 
     def save(self) -> None:
@@ -126,6 +158,11 @@ class ContinuityStore:
                 str(gid): [asdict(b) for b in items]
                 for gid, items in self.backlog.items()
                 if items
+            },
+            "settings": {
+                str(gid): asdict(s)
+                for gid, s in self.settings.items()
+                if s != GuildSettings()
             },
         }
         tmp = self.path.with_suffix(".tmp")
@@ -149,6 +186,11 @@ class ContinuityStore:
         for gid, items in payload.get("backlog", {}).items():
             try:
                 store.backlog[int(gid)] = [BacklogItem(**b) for b in items]
+            except (KeyError, TypeError):
+                continue
+        for gid, values in payload.get("settings", {}).items():
+            try:
+                store.settings[int(gid)] = GuildSettings(**values)
             except (KeyError, TypeError):
                 continue
         return store
