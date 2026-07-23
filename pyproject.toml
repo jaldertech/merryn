@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "merryn"
-version = "1.0.0"
+version = "1.1.0"
 description = "Discord meeting moderator: speaking queue with enforced muting, agenda tracking, timed anonymous ballots, and deterministic minutes."
 readme = "README.md"
 license = { text = "MIT" }

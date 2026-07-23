@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .meeting import Meeting, iso_to_dt, now_iso
@@ -44,6 +44,49 @@ def fmt_duration(seconds: float) -> str:
     return f"{seconds}s"
 
 
+def display_tz() -> tzinfo:
+    """The concrete timezone used for display and schedule parsing.
+
+    MERRYN_TIMEZONE when set and valid, otherwise the host's local zone.
+    Unlike DISPLAY_TZ this is never None, so callers can build aware
+    datetimes and compare them directly.
+    """
+    return DISPLAY_TZ or datetime.now(timezone.utc).astimezone().tzinfo
+
+
+# Accepted absolute date/time inputs for /meeting schedule. A bare HH:MM is
+# handled separately as "the next occurrence of that time".
+SCHEDULE_FORMATS = ("%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M")
+
+
+def parse_local_datetime(
+    value: str, now: datetime | None = None, tz: tzinfo | None = None
+) -> datetime | None:
+    """Parse a local date and time, or None if it cannot be read.
+
+    Parsed against the configured display timezone (MERRYN_TIMEZONE) rather
+    than a hardcoded zone, so an operator anywhere schedules in their own
+    local time. A bare ``HH:MM`` means the next occurrence of that time, so
+    scheduling tonight's meeting does not require typing today's date.
+    """
+    tz = tz or display_tz()
+    value = value.strip()
+    now = now or datetime.now(tz)
+    for fmt in SCHEDULE_FORMATS:
+        try:
+            return datetime.strptime(value, fmt).replace(tzinfo=tz)
+        except ValueError:
+            continue
+    try:
+        parsed = datetime.strptime(value, "%H:%M").time()
+    except ValueError:
+        return None
+    candidate = now.replace(
+        hour=parsed.hour, minute=parsed.minute, second=0, microsecond=0
+    )
+    return candidate if candidate > now else candidate + timedelta(days=1)
+
+
 def build_minutes(meeting: Meeting, ended_at: str | None = None) -> str:
     ended_at = ended_at or now_iso()
     duration = (iso_to_dt(ended_at) - iso_to_dt(meeting.started_at)).total_seconds()
@@ -56,6 +99,10 @@ def build_minutes(meeting: Meeting, ended_at: str | None = None) -> str:
     lines.append(f"- **Duration:** {fmt_duration(duration)}")
     lines.append(f"- **Presiding:** {meeting.started_by_name}")
     lines.append(f"- **Mode:** {meeting.mode}")
+    if meeting.quorum_active():
+        lines.append(f"- **Quorum:** {meeting.quorum_size} members")
+    elif meeting.quorum_enabled:
+        lines.append("- **Quorum:** enabled but not set — not enforced")
     lines.append("")
 
     # --- Attendance ---
@@ -141,10 +188,23 @@ def build_minutes(meeting: Meeting, ended_at: str | None = None) -> str:
                 f"- {local(m.at)} — “{m.text}” (moved by {m.moved_by}) — "
                 f"**{m.outcome.upper()}** (✅ {m.yes} / ❌ {m.no}{pct_note}{abst_note})"
             )
+            if m.quorum_override:
+                lines.append(
+                    f"  - ⚠️ **Taken under chair override** — {m.eligible} present, "
+                    f"{m.quorum_size} required for a quorum."
+                )
         lines.append("")
 
     # --- Decisions / actions / notes ---
-    for kind, heading in (("decision", "Decisions"), ("action", "Actions"), ("note", "Notes")):
+    for kind, heading in (
+        ("decision", "Decisions"),
+        ("action", "Actions"),
+        ("note", "Notes"),
+        # Procedural entries are written by the bot itself (quorum changes
+        # and overrides), never by a command, so the conduct of the meeting
+        # is auditable separately from its substance.
+        ("procedural", "Procedural"),
+    ):
         entries = [e for e in meeting.logs if e.kind == kind]
         if not entries:
             continue
