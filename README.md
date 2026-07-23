@@ -86,6 +86,11 @@ meetings need a firm but fair chair.
   makes bot audio capture impossible — so the minutes only contain
   what participants log manually with those commands during the
   meeting. Get into the habit of `/note`-ing as you go.
+- **Minutes archive (optional)** — set `MINUTES_CHANNEL_NAME` (default
+  `minutes`) or `MINUTES_CHANNEL_ID`, and when a real meeting ends Merryn
+  also files a summary embed and the same Markdown file to that channel,
+  so the group keeps a permanent, skimmable record separate from the
+  working channel. Test meetings are never archived.
 - **Motivation** — `/motivation` works in any channel, any time; Merryn
   replies with a random word of encouragement.
 
@@ -167,6 +172,7 @@ directory Merryn is started from (see `.env.example`):
 | `GUILD_ID` | recommended | Your server ID; makes slash commands appear instantly instead of within the hour |
 | `MOD_ROLE_ID` | no | Role whose holders count as moderators (Manage Server always qualifies) |
 | `DATA_DIR` | no | State and minutes location (default `./merryn-data`) |
+| `MINUTES_CHANNEL_NAME` / `MINUTES_CHANNEL_ID` | no | Archive channel for minutes (name default `minutes`); unset disables the archive |
 | `HOLD_MUSIC_FILE` | no | Your own hold music: 48 kHz 16-bit WAV, mono or stereo |
 | `MERRYN_TIMEZONE` | no | Timezone for minutes, e.g. `Europe/London` (default: system local time) |
 | `OPUS_LIBRARY` | no | Explicit path to libopus if it is somewhere unusual |
