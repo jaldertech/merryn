@@ -123,6 +123,27 @@ def test_settings_persistence():
     print("settings persistence OK")
 
 
+def test_update_is_newer():
+    from merryn.update import is_newer
+
+    assert is_newer("v1.2.0", "1.1.0")
+    assert is_newer("1.10.0", "1.9.0")  # numeric, not lexical
+    assert is_newer("v1.2.0-rc1", "1.1.0")  # pre-release suffix ignored
+    assert is_newer("v1.2", "1.1.0")  # uneven lengths pad with zeros
+    assert not is_newer("1.2.0", "1.2.0")
+    assert not is_newer("v1.1.0", "1.2.0")
+    assert not is_newer("garbage", "1.1.0")  # unparseable stays quiet
+    assert not is_newer("v1.2.0", "also-garbage")
+    print("update is_newer OK")
+
+
+def test_version_single_sourced():
+    import merryn
+
+    assert merryn.__version__ and merryn.__version__[0].isdigit()
+    print(f"version single-sourced OK ({merryn.__version__})")
+
+
 if __name__ == "__main__":
     test_hold_music_loops()
     test_motion_outcomes()
@@ -131,4 +152,6 @@ if __name__ == "__main__":
     test_schedule_parse()
     test_minutes_quorum_and_procedural()
     test_settings_persistence()
+    test_update_is_newer()
+    test_version_single_sourced()
     print("all smoke tests passed")

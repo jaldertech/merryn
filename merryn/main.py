@@ -7,6 +7,7 @@ deterministic end-of-meeting minutes.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -14,10 +15,12 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import tasks
 
+from . import __version__
 from .audio import LoopingWAVAudio, ensure_opus, resolve_hold_music
 from .meeting import (
     MODE_ADVISORY,
@@ -39,6 +42,7 @@ from .minutes import (
     parse_local_datetime,
 )
 from .store import BacklogItem, ContinuityStore, OpenAction
+from .update import is_newer
 from .views import ConfirmAdjournView, MotionView, PanelView
 
 log = logging.getLogger("merryn")
@@ -65,6 +69,18 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "merryn-data"))
 TOKEN = os.environ.get("DISCORD_TOKEN", "")
 GUILD_ID = int(os.environ["GUILD_ID"]) if os.environ.get("GUILD_ID") else None
 MOD_ROLE_ID = int(os.environ["MOD_ROLE_ID"]) if os.environ.get("MOD_ROLE_ID") else None
+
+# Optional update-notification check: once a day Merryn asks GitHub whether a
+# newer release exists and, if so, logs it and DMs the application owner once.
+# It only ever contacts GitHub (the source of the code); set MERRYN_UPDATE_CHECK
+# to off/0/false/no to disable it entirely.
+GITHUB_REPO = "jaldertech/merryn"
+UPDATE_CHECK_ENABLED = os.environ.get("MERRYN_UPDATE_CHECK", "on").strip().lower() not in (
+    "off",
+    "0",
+    "false",
+    "no",
+)
 
 QUEUE_DISPLAY_CAP = 15
 PANEL_TITLE = "Meeting in session"
@@ -186,6 +202,9 @@ class Merryn(discord.Client):
         self._motion_tasks: dict[int, set[asyncio.Task]] = {}
         self._panel_bumps: dict[int, asyncio.Task] = {}
         self._open_ballots: dict[int, MotionView] = {}
+        # The release we last DMed the owner about, so a newer version is
+        # announced once rather than on every restart or daily check.
+        self._update_notified: str | None = None
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -194,6 +213,7 @@ class Merryn(discord.Client):
         (DATA_DIR / "minutes").mkdir(exist_ok=True)
         self.registry = Registry.load(DATA_DIR / "state.json")
         self.continuity = ContinuityStore.load(DATA_DIR / "continuity.json")
+        self._update_notified = self._load_update_state()
         self.add_view(PanelView(self))
 
         self.tree.add_command(meeting_group)
@@ -209,6 +229,8 @@ class Merryn(discord.Client):
             await self.tree.sync()
 
         self.panel_tick.start()
+        if UPDATE_CHECK_ENABLED:
+            self.update_tick.start()
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (id %s)", self.user, self.user.id)
@@ -224,6 +246,96 @@ class Merryn(discord.Client):
                 # resumed, so its mutes must not outlive it.
                 await self._ballot_unmute(meeting, guild)
             await self.refresh_panel(meeting)
+
+    # --- update notification ----------------------------------------------
+
+    _UPDATE_STATE_FILE = "update_check.json"
+
+    def _load_update_state(self) -> str | None:
+        try:
+            data = json.loads(
+                (DATA_DIR / self._UPDATE_STATE_FILE).read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data.get("notified")
+
+    def _save_update_state(self) -> None:
+        path = DATA_DIR / self._UPDATE_STATE_FILE
+        try:
+            path.write_text(
+                json.dumps({"notified": self._update_notified}), encoding="utf-8"
+            )
+        except OSError:
+            log.warning("Could not persist update-check state")
+
+    async def _check_for_update(self) -> None:
+        """Ask GitHub whether a newer release exists; log it, and DM the app
+        owner once per new version. Only ever contacts GitHub, and any
+        failure (offline, rate-limited) is swallowed silently."""
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"merryn/{__version__}",
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    if resp.status != 200:
+                        return
+                    data = await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return
+
+        latest = data.get("tag_name") or ""
+        if not is_newer(latest, __version__):
+            return
+
+        release_url = data.get("html_url", "")
+        log.info(
+            "A newer Merryn release is available: %s (running %s) — %s",
+            latest,
+            __version__,
+            release_url,
+        )
+        if self._update_notified == latest:
+            return  # already told the owner about this one
+        if await self._notify_owner_of_update(latest, release_url):
+            self._update_notified = latest
+            self._save_update_state()
+
+    async def _notify_owner_of_update(self, latest: str, url: str) -> bool:
+        """DM the application owner about a new release. Returns True if the
+        message was delivered (so it is not retried needlessly)."""
+        try:
+            info = await self.application_info()
+        except discord.HTTPException:
+            return False
+        owner = info.owner
+        if owner is None:  # team-owned apps expose no single owner user
+            return False
+        try:
+            await owner.send(
+                f"📦 A newer version of **Merryn** is available: **{latest}** "
+                f"(you're running {__version__}).\n{url}\n"
+                f"The release notes explain how to update. Set "
+                f"`MERRYN_UPDATE_CHECK=off` to silence these notices."
+            )
+        except discord.HTTPException:
+            return False
+        return True
+
+    @tasks.loop(hours=24)
+    async def update_tick(self) -> None:
+        await self._check_for_update()
+
+    @update_tick.before_loop
+    async def _before_update_tick(self) -> None:
+        # Wait for login so application_info() and DMs work; the loop's first
+        # iteration then serves as the on-startup check.
+        await self.wait_until_ready()
 
     # --- panel -------------------------------------------------------------
 
