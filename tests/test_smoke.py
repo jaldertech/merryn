@@ -117,10 +117,70 @@ def test_settings_persistence():
     assert store.settings_for(42) == GuildSettings()
     store.set_quorum_size(42, 8)
     store.set_quorum_enabled(42, True)
+    store.set_second_required(42, True)
     reloaded = ContinuityStore.load(path)
-    assert reloaded.settings_for(42) == GuildSettings(quorum_enabled=True, quorum_size=8)
+    assert reloaded.settings_for(42) == GuildSettings(
+        quorum_enabled=True, quorum_size=8, second_required=True
+    )
     assert reloaded.settings_for(999) == GuildSettings()
     print("settings persistence OK")
+
+
+def test_duration_parse():
+    p = minutes.parse_duration
+    assert p("10m") == 600
+    assert p("1h30m") == 5400
+    assert p("2d") == 172800
+    assert p("45s") == 45
+    assert p("1h30m10s") == 5410
+    assert p("  5m  ") == 300
+    assert p("") is None
+    assert p("garbage") is None
+    assert p("5") is None
+    print("duration parse OK")
+
+
+def test_chunk_for_discord():
+    c = minutes.chunk_for_discord("a" * 100)
+    assert c == ["a" * 100]
+
+    many_lines = "\n".join(f"line {i}" for i in range(500))
+    chunks = minutes.chunk_for_discord(many_lines, limit=2000)
+    assert all(len(x) <= 2000 for x in chunks)
+    assert "\n".join(chunks) == many_lines
+
+    # A single line longer than the limit must be hard-split, not dropped.
+    huge = "x" * 5000
+    chunks = minutes.chunk_for_discord(huge, limit=2000)
+    assert sum(len(x) for x in chunks) == 5000
+    assert "".join(chunks) == huge
+    print("chunk for discord OK")
+
+
+def test_reminder_persistence():
+    from merryn.store import PendingReminder, PersonalReminder
+
+    path = Path(tempfile.mkdtemp()) / "continuity.json"
+    store = ContinuityStore(path)
+    store.add_reminder(
+        1, PendingReminder(event_id=99, channel_id=2, title="Meeting",
+                            start_at="2026-08-01T19:00:00+00:00")
+    )
+    store.add_personal_reminder(
+        PersonalReminder(user_id=9, guild_id=1, channel_id=5, text="stretch",
+                          fire_at="2026-07-29T18:00:00+00:00")
+    )
+    reloaded = ContinuityStore.load(path)
+    assert len(list(reloaded.iter_reminders())) == 1
+    assert len(reloaded.personal_reminders) == 1
+
+    reloaded.mark_reminder_fired(1, 99)
+    reloaded.prune_reminder(1, 99)
+    reloaded.pop_personal_reminder(reloaded.personal_reminders[0].id)
+    final = ContinuityStore.load(path)
+    assert list(final.iter_reminders()) == []
+    assert final.personal_reminders == []
+    print("reminder persistence OK")
 
 
 def test_update_is_newer():
@@ -152,6 +212,9 @@ if __name__ == "__main__":
     test_schedule_parse()
     test_minutes_quorum_and_procedural()
     test_settings_persistence()
+    test_duration_parse()
+    test_chunk_for_discord()
+    test_reminder_persistence()
     test_update_is_newer()
     test_version_single_sourced()
     print("all smoke tests passed")

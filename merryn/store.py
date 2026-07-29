@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,6 +52,40 @@ class BacklogItem:
 
 
 @dataclass
+class PendingReminder:
+    """A pre-meeting ping still owed for a /meeting schedule event.
+
+    Keyed by the Discord scheduled event's id, which is unique per guild
+    and lets a restart tell a reminder already fired from one still due
+    without needing its own separate id scheme.
+    """
+
+    event_id: int
+    channel_id: int
+    title: str
+    start_at: str  # UTC ISO-8601, matching the rest of the codebase
+    fired: bool = False
+
+
+@dataclass
+class PersonalReminder:
+    """A member's own /remind — independent of any guild business.
+
+    Delivered by DM; falls back to pinging the member in the channel it
+    was set from if their DMs are closed. Not guild-keyed like the rest
+    of this store, since delivery is to a user, not a chamber.
+    """
+
+    user_id: int
+    guild_id: int
+    channel_id: int
+    text: str
+    fire_at: str  # UTC ISO-8601
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    at: str = field(default_factory=now_iso)
+
+
+@dataclass
 class GuildSettings:
     """Standing configuration for a guild, independent of any meeting.
 
@@ -61,6 +96,10 @@ class GuildSettings:
 
     quorum_enabled: bool = False
     quorum_size: int = 0
+    # Whether a motion needs a second before it reaches a ballot. Off by
+    # default — an opt-in stricter procedure, not a retroactive change to
+    # how existing servers already run. /second enable|disable|show.
+    second_required: bool = False
 
 
 class ContinuityStore:
@@ -71,6 +110,13 @@ class ContinuityStore:
         self.actions: dict[int, list[OpenAction]] = {}
         self.backlog: dict[int, list[BacklogItem]] = {}
         self.settings: dict[int, GuildSettings] = {}
+        # Pre-meeting pings still owed, per guild. Pruned once the meeting's
+        # start time has passed, fired or not, so a cancelled or forgotten
+        # event does not linger forever.
+        self.reminders: dict[int, list[PendingReminder]] = {}
+        # Members' own /remind reminders, flat rather than guild-keyed —
+        # delivery is to a user via DM, independent of chamber business.
+        self.personal_reminders: list[PersonalReminder] = []
 
     # --- actions ---------------------------------------------------------
 
@@ -145,6 +191,56 @@ class ContinuityStore:
         self.save()
         return settings
 
+    def set_second_required(self, guild_id: int, enabled: bool) -> GuildSettings:
+        settings = self.settings.setdefault(guild_id, GuildSettings())
+        settings.second_required = enabled
+        self.save()
+        return settings
+
+    # --- meeting reminders -------------------------------------------------
+
+    def add_reminder(self, guild_id: int, reminder: PendingReminder) -> None:
+        self.reminders.setdefault(guild_id, []).append(reminder)
+        self.save()
+
+    def mark_reminder_fired(self, guild_id: int, event_id: int) -> None:
+        for r in self.reminders.get(guild_id, []):
+            if r.event_id == event_id:
+                r.fired = True
+        self.save()
+
+    def prune_reminder(self, guild_id: int, event_id: int) -> None:
+        items = [
+            r for r in self.reminders.get(guild_id, []) if r.event_id != event_id
+        ]
+        if items:
+            self.reminders[guild_id] = items
+        else:
+            self.reminders.pop(guild_id, None)
+        self.save()
+
+    def iter_reminders(self):
+        """Yields (guild_id, PendingReminder) for every reminder still
+        tracked, across all guilds — the reminder tick has nothing else to
+        key on ahead of time."""
+        for gid, items in self.reminders.items():
+            for r in items:
+                yield gid, r
+
+    # --- personal reminders ------------------------------------------------
+
+    def add_personal_reminder(self, reminder: PersonalReminder) -> None:
+        self.personal_reminders.append(reminder)
+        self.save()
+
+    def pop_personal_reminder(self, reminder_id: str) -> None:
+        before = len(self.personal_reminders)
+        self.personal_reminders = [
+            r for r in self.personal_reminders if r.id != reminder_id
+        ]
+        if len(self.personal_reminders) != before:
+            self.save()
+
     # --- persistence -----------------------------------------------------
 
     def save(self) -> None:
@@ -164,6 +260,12 @@ class ContinuityStore:
                 for gid, s in self.settings.items()
                 if s != GuildSettings()
             },
+            "reminders": {
+                str(gid): [asdict(r) for r in items]
+                for gid, items in self.reminders.items()
+                if items
+            },
+            "personal_reminders": [asdict(r) for r in self.personal_reminders],
         }
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -191,6 +293,16 @@ class ContinuityStore:
         for gid, values in payload.get("settings", {}).items():
             try:
                 store.settings[int(gid)] = GuildSettings(**values)
+            except (KeyError, TypeError):
+                continue
+        for gid, items in payload.get("reminders", {}).items():
+            try:
+                store.reminders[int(gid)] = [PendingReminder(**r) for r in items]
+            except (KeyError, TypeError):
+                continue
+        for item in payload.get("personal_reminders", []):
+            try:
+                store.personal_reminders.append(PersonalReminder(**item))
             except (KeyError, TypeError):
                 continue
         return store

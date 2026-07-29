@@ -6,6 +6,7 @@ meeting, so the same meeting always produces the same minutes.
 from __future__ import annotations
 
 import os
+import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -85,6 +86,27 @@ def parse_local_datetime(
         hour=parsed.hour, minute=parsed.minute, second=0, microsecond=0
     )
     return candidate if candidate > now else candidate + timedelta(days=1)
+
+
+DURATION_UNITS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+DURATION_PATTERN = re.compile(
+    r"^(?:(?P<d>\d+)d)?(?:(?P<h>\d+)h)?(?:(?P<m>\d+)m)?(?:(?P<s>\d+)s)?$"
+)
+
+
+def parse_duration(value: str) -> int | None:
+    """Parses a short duration like '10m', '1h30m' or '2d' into seconds.
+
+    None if it cannot be read, or if no unit was present at all (an empty
+    string technically matches the pattern otherwise).
+    """
+    match = DURATION_PATTERN.fullmatch(value.strip().lower())
+    if match is None:
+        return None
+    parts = match.groupdict()
+    if not any(parts.values()):
+        return None
+    return sum(int(v) * DURATION_UNITS[k] for k, v in parts.items() if v)
 
 
 def build_minutes(meeting: Meeting, ended_at: str | None = None) -> str:
@@ -184,8 +206,9 @@ def build_minutes(meeting: Meeting, ended_at: str | None = None) -> str:
             abst_note = (
                 f", {abst_pct}% abstained" if abst_pct is not None else ""
             )
+            seconder_note = f", seconded by {m.seconded_by}" if m.seconded_by else ""
             lines.append(
-                f"- {local(m.at)} — “{m.text}” (moved by {m.moved_by}) — "
+                f"- {local(m.at)} — “{m.text}” (moved by {m.moved_by}{seconder_note}) — "
                 f"**{m.outcome.upper()}** (✅ {m.yes} / ❌ {m.no}{pct_note}{abst_note})"
             )
             if m.quorum_override:
@@ -224,3 +247,32 @@ def build_minutes(meeting: Meeting, ended_at: str | None = None) -> str:
 def filename_for(meeting: Meeting) -> str:
     started = iso_to_dt(meeting.started_at).astimezone(DISPLAY_TZ)
     return f"minutes_{started.strftime('%Y%m%d_%H%M')}.md"
+
+
+def chunk_for_discord(text: str, limit: int = 2000) -> list[str]:
+    """Splits minutes text into plain messages under Discord's per-message
+    character limit, breaking on line boundaries where possible. A single
+    line longer than the limit (unlikely in practice, but not impossible)
+    is hard-split rather than dropped.
+
+    The file attachment already carries the polished document; this exists
+    so the same content also lands as ordinary message content, which is
+    the only thing Discord's own search indexes.
+    """
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        while len(line) > limit:
+            chunks.append(line[:limit])
+            line = line[limit:]
+        current = line
+    if current:
+        chunks.append(current)
+    return chunks

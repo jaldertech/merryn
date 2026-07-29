@@ -25,6 +25,7 @@ from .audio import LoopingWAVAudio, ensure_opus, resolve_hold_music
 from .meeting import (
     MODE_ADVISORY,
     MODE_STRICT,
+    UTC,
     Meeting,
     MotionRecord,
     Registry,
@@ -34,16 +35,24 @@ from .meeting import (
 )
 from .minutes import (
     build_minutes,
+    chunk_for_discord,
     display_tz,
     filename_for,
     fmt_duration,
     local,
     local_date,
+    parse_duration,
     parse_local_datetime,
 )
-from .store import BacklogItem, ContinuityStore, OpenAction
+from .store import (
+    BacklogItem,
+    ContinuityStore,
+    OpenAction,
+    PendingReminder,
+    PersonalReminder,
+)
 from .update import is_newer
-from .views import ConfirmAdjournView, MotionView, PanelView
+from .views import ConfirmAdjournView, MotionView, PanelView, SecondView
 
 log = logging.getLogger("merryn")
 
@@ -84,6 +93,11 @@ UPDATE_CHECK_ENABLED = os.environ.get("MERRYN_UPDATE_CHECK", "on").strip().lower
 
 QUEUE_DISPLAY_CAP = 15
 PANEL_TITLE = "Meeting in session"
+
+# How long before a /meeting schedule event's start Merryn pings the
+# channel. The tick checking for this runs every 60s, so anything shorter
+# than a couple of minutes risks missing the window on a slow tick.
+MEETING_REMINDER_LEAD_MINUTES = int(os.environ.get("MEETING_REMINDER_LEAD_MINUTES", "10"))
 
 # Optional minutes archive: when a real (non-test) meeting ends, a summary
 # embed and the full Markdown minutes are also filed to this channel (found
@@ -220,6 +234,7 @@ class Merryn(discord.Client):
         self.tree.add_command(agenda_group)
         self.tree.add_command(floor_group)
         self.tree.add_command(quorum_group)
+        self.tree.add_command(second_group)
         self.tree.add_command(actions_group)
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
@@ -231,6 +246,8 @@ class Merryn(discord.Client):
         self.panel_tick.start()
         if UPDATE_CHECK_ENABLED:
             self.update_tick.start()
+        self.meeting_reminder_tick.start()
+        self.personal_reminder_tick.start()
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (id %s)", self.user, self.user.id)
@@ -336,6 +353,85 @@ class Merryn(discord.Client):
         # Wait for login so application_info() and DMs work; the loop's first
         # iteration then serves as the on-startup check.
         await self.wait_until_ready()
+
+    @tasks.loop(seconds=60)
+    async def meeting_reminder_tick(self) -> None:
+        now = datetime.now(UTC)
+        for guild_id, reminder in list(self.continuity.iter_reminders()):
+            start = iso_to_dt(reminder.start_at)
+            if now >= start:
+                # The meeting's own start time has arrived; whether or not
+                # the ping fired, there is nothing left to track.
+                self.continuity.prune_reminder(guild_id, reminder.event_id)
+                continue
+            if reminder.fired:
+                continue
+            if now >= start - timedelta(minutes=MEETING_REMINDER_LEAD_MINUTES):
+                await self._fire_meeting_reminder(guild_id, reminder, start)
+                self.continuity.mark_reminder_fired(guild_id, reminder.event_id)
+
+    @meeting_reminder_tick.before_loop
+    async def _before_meeting_reminder_tick(self) -> None:
+        await self.wait_until_ready()
+
+    async def _fire_meeting_reminder(
+        self, guild_id: int, reminder: PendingReminder, start: datetime
+    ) -> None:
+        channel = self.get_channel(reminder.channel_id)
+        if channel is None:
+            log.warning(
+                "Meeting reminder: channel %s not found (guild=%s)",
+                reminder.channel_id,
+                guild_id,
+            )
+            return
+        try:
+            await channel.send(
+                f"🔔 **{reminder.title}** starts <t:{int(start.timestamp())}:R>."
+            )
+        except discord.HTTPException as exc:
+            log.warning("Meeting reminder send failed (guild=%s): %s", guild_id, exc)
+
+    @tasks.loop(seconds=60)
+    async def personal_reminder_tick(self) -> None:
+        now = datetime.now(UTC)
+        for reminder in list(self.continuity.personal_reminders):
+            if now >= iso_to_dt(reminder.fire_at):
+                await self._fire_personal_reminder(reminder)
+                self.continuity.pop_personal_reminder(reminder.id)
+
+    @personal_reminder_tick.before_loop
+    async def _before_personal_reminder_tick(self) -> None:
+        await self.wait_until_ready()
+
+    async def _fire_personal_reminder(self, reminder: PersonalReminder) -> None:
+        message = f"⏰ Reminder: {reminder.text}"
+        user = self.get_user(reminder.user_id)
+        if user is None:
+            try:
+                user = await self.fetch_user(reminder.user_id)
+            except discord.HTTPException:
+                user = None
+        if user is not None:
+            try:
+                await user.send(message)
+                return
+            except discord.HTTPException:
+                pass  # DMs closed or user unreachable — fall back below.
+        channel = self.get_channel(reminder.channel_id)
+        if channel is None:
+            log.warning(
+                "Personal reminder: channel %s not found (user=%s)",
+                reminder.channel_id,
+                reminder.user_id,
+            )
+            return
+        try:
+            await channel.send(f"⏰ <@{reminder.user_id}> — {reminder.text}")
+        except discord.HTTPException as exc:
+            log.warning(
+                "Personal reminder send failed (user=%s): %s", reminder.user_id, exc
+            )
 
     # --- panel -------------------------------------------------------------
 
@@ -1025,11 +1121,17 @@ class Merryn(discord.Client):
         return embed
 
     async def _archive_minutes(
-        self, meeting: Meeting, ended_at: str, path: Path, working_channel_id: int
+        self, meeting: Meeting, ended_at: str, path: Path, working_channel_id: int, text: str
     ) -> None:
         """File a real meeting's minutes to the archive channel, if one is
         configured. Skipped for test meetings by the caller; a duplicate is
-        suppressed when the working channel already is the archive."""
+        suppressed when the working channel already is the archive.
+
+        Posts the embed digest and the .md file (the polished document) and
+        then the full text as plain message(s) — Discord's own search only
+        indexes message content, never attachments, so a long sitting's
+        minutes would otherwise be unsearchable in the archive channel.
+        """
         guild = self.get_guild(meeting.guild_id)
         if guild is None:
             return
@@ -1041,6 +1143,8 @@ class Merryn(discord.Client):
                 embed=self._minutes_summary_embed(meeting, ended_at),
                 file=discord.File(path, filename=path.name),
             )
+            for chunk in chunk_for_discord(text):
+                await archive.send(chunk)
         except discord.HTTPException:
             log.warning(
                 "Minutes archive post failed (guild=%s, channel=%s)",
@@ -1106,7 +1210,7 @@ class Merryn(discord.Client):
         # meetings leave no trace; a duplicate is suppressed when the working
         # channel already is the archive.
         if meeting.persistent:
-            await self._archive_minutes(meeting, ended_at, path, target.id)
+            await self._archive_minutes(meeting, ended_at, path, target.id, text)
 
         await interaction.followup.send("Done.", ephemeral=True)
 
@@ -1287,9 +1391,15 @@ class Merryn(discord.Client):
         )
         lines = [
             f"Moved by **{record.moved_by}** · closes <t:{view.closes_at_unix}:R>",
-            f"Carries on {requirement}",
-            f"Votes cast: **{cast} / {eligible}** (anonymous)",
         ]
+        if record.seconded_by:
+            lines.append(f"Seconded by **{record.seconded_by}**")
+        lines.extend(
+            [
+                f"Carries on {requirement}",
+                f"Votes cast: **{cast} / {eligible}** (anonymous)",
+            ]
+        )
         if record.quorum_override:
             # Declared on the ballot itself so members voting in a forced
             # ballot know at the time, not only when the minutes appear.
@@ -1312,6 +1422,7 @@ class Merryn(discord.Client):
         seconds: int,
         pass_threshold: int | None = None,
         override: bool = False,
+        seconded_by: str | None = None,
     ) -> None:
         existing = self._open_ballots.get(interaction.guild_id)
         if existing is not None and not existing.is_finished():
@@ -1357,6 +1468,7 @@ class Merryn(discord.Client):
             pass_threshold=pass_threshold,
             quorum_size=meeting.quorum_size if meeting.quorum_active() else 0,
             quorum_override=override_used,
+            seconded_by=seconded_by,
         )
         meeting.motions.append(record)
         self.registry.save()
@@ -1379,6 +1491,59 @@ class Merryn(discord.Client):
         )
 
         await self._start_ballot_ambience(meeting, interaction.guild)
+
+    async def handle_second_motion(
+        self, interaction: discord.Interaction, view: SecondView
+    ) -> None:
+        """A member has pressed *Second this motion* on a SecondView.
+
+        Validates them, then hands off to open_motion exactly as if they
+        had been named inline on /motion — the ballot that results is
+        indistinguishable either way.
+        """
+        if view.is_finished():
+            await interaction.response.send_message(
+                "This motion has already been dealt with.", ephemeral=True
+            )
+            return
+        member = interaction.user
+        voice = getattr(member, "voice", None)
+        if not voice or not voice.channel or voice.channel.id != view.voice_channel_id:
+            await interaction.response.send_message(
+                "Only members present in the voice chamber may second a motion.",
+                ephemeral=True,
+            )
+            return
+        if member.id == view.mover_id:
+            await interaction.response.send_message(
+                "The mover cannot also second their own motion.", ephemeral=True
+            )
+            return
+        meeting = self.registry.get(interaction.guild_id)
+        if meeting is None:
+            await interaction.response.send_message(
+                "That meeting has since ended.", ephemeral=True
+            )
+            return
+
+        view.stop()
+        if view.message is not None:
+            try:
+                await view.message.edit(
+                    content=f"🤝 Seconded by **{member.display_name}**.", view=None
+                )
+            except discord.HTTPException:
+                pass
+
+        await self.open_motion(
+            interaction,
+            meeting,
+            view.motion_text,
+            view.motion_seconds,
+            view.pass_threshold,
+            override=view.override,
+            seconded_by=member.display_name,
+        )
 
     async def update_ballot_tally(
         self, guild: discord.Guild, view: MotionView
@@ -1603,10 +1768,27 @@ async def meeting_schedule(
         )
         return
 
+    if MEETING_REMINDER_LEAD_MINUTES > 0:
+        bot.continuity.add_reminder(
+            interaction.guild_id,
+            PendingReminder(
+                event_id=event.id,
+                channel_id=interaction.channel_id,
+                title=event.name,
+                start_at=start.astimezone(UTC).isoformat(),
+            ),
+        )
+
+    reminder_note = (
+        f" I will also ping this channel {MEETING_REMINDER_LEAD_MINUTES} "
+        "minutes before."
+        if MEETING_REMINDER_LEAD_MINUTES > 0
+        else ""
+    )
     await interaction.followup.send(
         f"🗓️ **{event.name}** — <t:{int(start.timestamp())}:F> in "
         f"{voice_channel.mention}. Press *Interested* on the event to be "
-        f"reminded when it starts.\n{event.url}"
+        f"reminded when it starts.{reminder_note}\n{event.url}"
     )
 
 
@@ -1971,6 +2153,52 @@ async def quorum_show(interaction: discord.Interaction) -> None:
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
+second_group = app_commands.Group(
+    name="second",
+    description="Control whether a motion needs a second before it reaches a ballot",
+    guild_only=True,
+)
+
+
+@second_group.command(
+    name="enable", description="Require a second before a motion reaches a ballot"
+)
+async def second_enable(interaction: discord.Interaction) -> None:
+    bot: Merryn = interaction.client
+    if not await bot._require_moderator(interaction):
+        return
+    bot.continuity.set_second_required(interaction.guild_id, True)
+    await interaction.response.send_message(
+        "🤝 Seconding is **required** — `/motion` now needs `second:` naming "
+        "a fellow member in the chamber, or waits for one of them to press "
+        "*Second this motion*, before the ballot opens."
+    )
+
+
+@second_group.command(name="disable", description="Stop requiring a second on motions")
+async def second_disable(interaction: discord.Interaction) -> None:
+    bot: Merryn = interaction.client
+    if not await bot._require_moderator(interaction):
+        return
+    bot.continuity.set_second_required(interaction.guild_id, False)
+    await interaction.response.send_message(
+        "🤝 Seconding is **off** — `/motion` opens a ballot straight away, "
+        "as before."
+    )
+
+
+@second_group.command(
+    name="show", description="Show whether motions currently require a second"
+)
+async def second_show(interaction: discord.Interaction) -> None:
+    bot: Merryn = interaction.client
+    settings = bot.continuity.settings_for(interaction.guild_id)
+    state = "required" if settings.second_required else "not required"
+    await interaction.response.send_message(
+        f"**Seconding a motion:** {state}.", ephemeral=True
+    )
+
+
 actions_group = app_commands.Group(
     name="actions",
     description="Outstanding action items carried between meetings",
@@ -2095,6 +2323,49 @@ async def motivation_command(interaction: discord.Interaction) -> None:
 
 
 @app_commands.command(
+    name="remind", description="Ask Merryn to remind you of something later"
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    text="What to remind you of",
+    duration="How long from now, e.g. '10m', '1h30m', '2d' (max 30 days)",
+)
+async def remind_command(
+    interaction: discord.Interaction, text: str, duration: str
+) -> None:
+    seconds = parse_duration(duration)
+    if not seconds:
+        await interaction.response.send_message(
+            "I could not read that duration. Use a combination like `10m`, "
+            "`1h30m`, or `2d`.",
+            ephemeral=True,
+        )
+        return
+    if seconds > 30 * 86400:
+        await interaction.response.send_message(
+            "That is more than 30 days away — set it closer to the time.",
+            ephemeral=True,
+        )
+        return
+    bot: Merryn = interaction.client
+    fire_at = datetime.now(UTC) + timedelta(seconds=seconds)
+    bot.continuity.add_personal_reminder(
+        PersonalReminder(
+            user_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            text=text,
+            fire_at=fire_at.isoformat(),
+        )
+    )
+    await interaction.response.send_message(
+        f"⏰ I will remind you <t:{int(fire_at.timestamp())}:R> — by DM if I "
+        "can, or here if I cannot.",
+        ephemeral=True,
+    )
+
+
+@app_commands.command(
     name="holdmusic",
     description="Merryn joins your voice channel and plays hold music — no one is muted",
 )
@@ -2112,6 +2383,7 @@ async def holdmusic_command(interaction: discord.Interaction) -> None:
     seconds="How long the ballot stays open (default 60)",
     pass_percent="Percentage of votes cast needed to carry, e.g. 75 (default: simple majority)",
     override="Moderators only: force the ballot despite an inquorate chamber",
+    second="Name who seconds it now — only needed if /second is required in this server",
 )
 async def motion_command(
     interaction: discord.Interaction,
@@ -2119,6 +2391,7 @@ async def motion_command(
     seconds: app_commands.Range[int, 15, 600] = 60,
     pass_percent: app_commands.Range[int, 1, 100] | None = None,
     override: bool = False,
+    second: discord.Member | None = None,
 ) -> None:
     bot: Merryn = interaction.client
     meeting = await bot._require_meeting(interaction)
@@ -2129,9 +2402,45 @@ async def motion_command(
             "Join the meeting voice channel first.", ephemeral=True
         )
         return
-    await bot.open_motion(
-        interaction, meeting, text, seconds, pass_percent, override=override
+
+    if not bot.continuity.settings_for(interaction.guild_id).second_required:
+        # Not required in this server: name one for the record if given,
+        # but nothing gates the ballot either way.
+        await bot.open_motion(
+            interaction, meeting, text, seconds, pass_percent,
+            override=override, seconded_by=second.display_name if second else None,
+        )
+        return
+
+    if second is not None:
+        if second.id == interaction.user.id:
+            await interaction.response.send_message(
+                "You cannot second your own motion.", ephemeral=True
+            )
+            return
+        if not in_meeting_voice(second, meeting):
+            await interaction.response.send_message(
+                f"{second.display_name} is not in the meeting voice channel.",
+                ephemeral=True,
+            )
+            return
+        await bot.open_motion(
+            interaction, meeting, text, seconds, pass_percent,
+            override=override, seconded_by=second.display_name,
+        )
+        return
+
+    # No seconder named: the motion waits for one before it becomes a ballot.
+    view = SecondView(
+        bot, interaction.user.id, meeting.voice_channel_id,
+        text, seconds, pass_percent, override,
     )
+    await interaction.response.send_message(
+        f"**{interaction.user.display_name}** moves: {text}\n"
+        "Awaiting a second from another member in the chamber.",
+        view=view,
+    )
+    view.message = await interaction.original_response()
 
 
 def build_help_embed(moderator: bool) -> discord.Embed:
@@ -2165,6 +2474,9 @@ def build_help_embed(moderator: bool) -> discord.Embed:
             "`/motion <text>` — open a ballot; anyone in the voice channel "
             "may move one. Add `seconds:` for a longer ballot, or `pass:75` "
             "to require a supermajority.\n"
+            "If this server requires a second (`/second show` says so), the "
+            "motion waits — press *Second this motion* on Merryn's post, or "
+            "the mover names one with `second:@member`.\n"
             "Votes are **anonymous** — the count is public, never who voted "
             "or which way. One ballot at a time.\n"
             "`/quorum show` — how many must be present, and whether that is "
@@ -2181,7 +2493,22 @@ def build_help_embed(moderator: bool) -> discord.Embed:
         ),
         inline=False,
     )
+    embed.add_field(
+        name="Odds and ends",
+        value=(
+            "`/remind text: duration:` — a personal reminder (e.g. `10m`, "
+            "`1h30m`, `2d`), by DM if I can, or in-channel if I cannot. "
+            "Not tied to meetings — usable any time."
+        ),
+        inline=False,
+    )
     if moderator:
+        schedule_reminder_note = (
+            f" I also ping this channel {MEETING_REMINDER_LEAD_MINUTES} "
+            "minutes before."
+            if MEETING_REMINDER_LEAD_MINUTES > 0
+            else ""
+        )
         embed.add_field(
             name="Chairing (moderators)",
             value=(
@@ -2189,8 +2516,10 @@ def build_help_embed(moderator: bool) -> discord.Embed:
                 "everyone but the recognised speaker; advisory only tracks the "
                 "queue. Add `agenda:\"a; b; c\"` and `quorum:` to override the "
                 "standing quorum for this meeting.\n"
-                "`/meeting schedule when:\"HH:MM\"` — add it to the server's "
-                "event calendar so members can be reminded.\n"
+                "`/meeting schedule when:` — add it to the server's event "
+                "calendar so members can be reminded. Accepts "
+                "`YYYY-MM-DD HH:MM`, `DD/MM/YYYY HH:MM`, or a bare `HH:MM` "
+                f"for the next occurrence.{schedule_reminder_note}\n"
                 "`/meeting test` — a sandbox meeting; nothing is carried "
                 "forward. `/meeting end` publishes the minutes.\n"
                 "🔔 on the panel calls the next speaker; `/floor give` "
@@ -2206,7 +2535,11 @@ def build_help_embed(moderator: bool) -> discord.Embed:
                 "enforcement on and off; the number is remembered either way.\n"
                 "An inquorate chamber cannot open a ballot. A moderator may "
                 "force one with `override: True` on `/motion` — that, and any "
-                "change to the number, is written into the minutes."
+                "change to the number, is written into the minutes.\n"
+                "`/second enable` — off by default; requires a different "
+                "member in the chamber to second a motion (inline with "
+                "`second:@member`, or by pressing the button) before it "
+                "reaches a ballot."
             ),
             inline=False,
         )
@@ -2243,6 +2576,7 @@ for command in (
     timer_command,
     motion_command,
     motivation_command,
+    remind_command,
     holdmusic_command,
     help_command,
 ):

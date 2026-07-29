@@ -47,6 +47,13 @@ meetings need a firm but fair chair.
   in favour and how many of those present abstained by not voting.
   An optional supermajority can be required per motion:
   `/motion text:"Buy the new marquee" pass:75 seconds:120`.
+- **Seconding** — off by default; `/second enable` requires every
+  motion to be seconded by a different member in the chamber before it
+  reaches a ballot. Name one inline with `/motion ... second:@member`,
+  or leave it blank and Merryn posts the motion with a *Second this
+  motion* button — the ballot opens the moment someone else presses it.
+  A motion nobody seconds simply lapses. Who seconded is shown on the
+  ballot and recorded in the minutes.
 - **Quorum** — `/quorum set 8` fixes how many members must be in the
   chamber before a ballot may be opened; `/quorum enable` and
   `/quorum disable` switch enforcement on and off without forgetting the
@@ -62,7 +69,10 @@ meetings need a firm but fair chair.
   themselves interested and be reminded. Times are read in the configured
   `MERRYN_TIMEZONE`; accepts `YYYY-MM-DD HH:MM`, `DD/MM/YYYY HH:MM`, or a
   bare `HH:MM` for the next occurrence. **Requires the Manage Events
-  permission** (see step 3).
+  permission** (see step 3). Merryn also pings the channel the meeting
+  was booked from `MEETING_REMINDER_LEAD_MINUTES` (default 10) before
+  the start time; set it to `0` to disable. The reminder is persisted,
+  so a restart in between never loses or double-fires it.
 - **Help** — `/help` explains how to use Merryn, privately. Moderators
   additionally see the chairing, quorum, and record-keeping sections.
 - **Hold music** — while a ballot is open, everyone in the voice
@@ -93,6 +103,11 @@ meetings need a firm but fair chair.
   working channel. Test meetings are never archived.
 - **Motivation** — `/motivation` works in any channel, any time; Merryn
   replies with a random word of encouragement.
+- **Reminders** — `/remind text:"..." duration:10m` (any combination of
+  `d`/`h`/`m`/`s`, up to 30 days) has Merryn remind you later, by DM if
+  your DMs are open, or by pinging you in the channel you set it from if
+  not. Not tied to meetings or server business — usable anywhere, any time.
+  Persisted, so a restart never loses one.
 
 ## Quick start
 
@@ -190,6 +205,8 @@ directory Merryn is started from (see `.env.example`):
 | `/meeting mode` | moderator | Switch strict/advisory mid-meeting |
 | `/quorum set <n>` · `/quorum enable` · `/quorum disable` | moderator | Members required in the chamber for a ballot; toggle enforcement |
 | `/quorum show` | anyone | The standing setting, and whether the chamber is quorate now |
+| `/second enable` · `/second disable` | moderator | Require (or stop requiring) a second before a motion reaches a ballot |
+| `/second show` | anyone | Whether seconding is currently required |
 | `/agenda add [owner]` | anyone between meetings, moderator during one | Add an item to the live agenda, or to the next meeting's backlog if none is in session |
 | `/agenda assign` · `/agenda next` | moderator | Assign a presenter; advance the agenda |
 | `/agenda show` · `/agenda drop <n>` | anyone (drop: proposer or moderator) | Show the agenda/backlog; remove a backlog item |
@@ -198,9 +215,10 @@ directory Merryn is started from (see `.env.example`):
 | `/note <text>` | anyone | Record a note in the minutes |
 | `/decision <text>` · `/action <text> [assignee]` | moderator | Record decisions/actions |
 | `/timer <seconds>` | moderator | Per-speaker limit (0 = off) |
-| `/motion <text> [seconds] [pass] [override]` | anyone in the VC | Open a timed ballot; `pass:75` requires 75% in favour; `override:` (moderators) forces an inquorate ballot |
+| `/motion <text> [seconds] [pass] [override] [second]` | anyone in the VC | Open a timed ballot; `pass:75` requires 75% in favour; `override:` (moderators) forces an inquorate ballot; `second` names a seconder inline where `/second` is required |
 | `/holdmusic` | anyone | Merryn joins your voice channel and loops hold music; run again to stop |
 | `/motivation` | anyone | A random word of encouragement |
+| `/remind text: duration:` | anyone | Reminds you later, by DM or in-channel fallback |
 
 "Moderator" = anyone with **Manage Server**, or the role named in
 `MOD_ROLE_ID`.

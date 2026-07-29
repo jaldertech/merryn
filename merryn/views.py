@@ -93,6 +93,38 @@ class ConfirmAdjournView(discord.ui.View):
         await self.bot.end_meeting(interaction)
 
 
+class SecondView(discord.ui.View):
+    """Shown for a motion moved under a seconding requirement, until
+    another member in the chamber seconds it. The motion never reaches a
+    ballot without one; it simply lapses if nobody presses the button
+    within the timeout.
+    """
+
+    def __init__(
+        self,
+        bot,
+        mover_id: int,
+        voice_channel_id: int,
+        motion_text: str,
+        motion_seconds: int,
+        pass_threshold: int | None,
+        override: bool,
+    ):
+        super().__init__(timeout=600)
+        self.bot = bot
+        self.mover_id = mover_id
+        self.voice_channel_id = voice_channel_id
+        self.motion_text = motion_text
+        self.motion_seconds = motion_seconds
+        self.pass_threshold = pass_threshold
+        self.override = override
+        self.message: discord.Message | None = None
+
+    @discord.ui.button(label="Second this motion", emoji="🤝", style=discord.ButtonStyle.primary)
+    async def second(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.bot.handle_second_motion(interaction, self)
+
+
 class MotionView(discord.ui.View):
     """Ballot buttons for one motion. Votes may be changed until close.
 
