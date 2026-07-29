@@ -90,6 +90,12 @@ class MotionRecord:
     # True when a moderator forced the ballot despite the chamber being
     # inquorate. Recorded so the minutes never hide a forced vote.
     quorum_override: bool = False
+    # Display name of whoever seconded the motion. None when seconding
+    # was not required for this guild at the time it was moved, or when
+    # /motion's own second: parameter was left blank under a requirement
+    # (in which case the motion never reaches a ballot without one — see
+    # SecondView/handle_second_motion).
+    seconded_by: str | None = None
     at: str = field(default_factory=now_iso)
 
     def percent_in_favour(self) -> int | None:
