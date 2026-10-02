@@ -3,4 +3,4 @@
 # Single source of truth for the version: pyproject.toml reads this via
 # setuptools' dynamic `attr`, and the runtime update-check compares against
 # it, so the two can never drift.
-__version__ = "1.3.0"
+__version__ = "1.4.0"
