@@ -8,7 +8,27 @@ permissions:
   contents: write
 
 jobs:
+  verify-version:
+    # Refuse to release when the tag and merryn.__version__ disagree. A tag
+    # ahead of the code ships binaries that report the old version, and the
+    # update check then tells every install about the release it already runs.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches merryn.__version__
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          # __init__.py has no imports, so this needs no dependencies installed.
+          code_version=$(python3 -c "import merryn; print(merryn.__version__)")
+          if [ "${TAG#v}" != "$code_version" ]; then
+            echo "::error::Tag $TAG does not match merryn.__version__ ($code_version). Bump __version__ in a PR, merge it, then tag that commit."
+            exit 1
+          fi
+          echo "Tag $TAG matches merryn.__version__ $code_version"
+
   build:
+    needs: verify-version
     strategy:
       fail-fast: false
       matrix:
