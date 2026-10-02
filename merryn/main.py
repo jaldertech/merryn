@@ -243,6 +243,7 @@ class Merryn(discord.Client):
         self.tree.add_command(quorum_group)
         self.tree.add_command(second_group)
         self.tree.add_command(actions_group)
+        self.tree.add_command(reminders_group)
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
             self.tree.copy_global_to(guild=guild)
@@ -1137,9 +1138,12 @@ class Merryn(discord.Client):
             carried = sum(1 for m in meeting.motions if m.outcome == "carried")
             failed = sum(1 for m in meeting.motions if m.outcome in ("failed", "tied"))
             voided = sum(1 for m in meeting.motions if m.outcome == "void")
+            withdrawn = sum(1 for m in meeting.motions if m.outcome == "withdrawn")
             parts = [f"{carried} carried", f"{failed} failed"]
             if voided:
                 parts.append(f"{voided} void")
+            if withdrawn:
+                parts.append(f"{withdrawn} withdrawn")
             embed.add_field(
                 name=f"Motions ({len(meeting.motions)})",
                 value=", ".join(parts),
@@ -1463,7 +1467,12 @@ class Merryn(discord.Client):
         pass_threshold: int | None = None,
         override: bool = False,
         seconded_by: str | None = None,
+        mover: discord.Member | None = None,
     ) -> None:
+        # The mover is not always the interaction's user: a motion awaiting
+        # a second opens from the seconder's button press. Permission checks
+        # and the record must follow the mover, not whoever pressed it.
+        mover = mover or interaction.user
         existing = self._open_ballots.get(interaction.guild_id)
         if existing is not None and not existing.is_finished():
             await interaction.response.send_message(
@@ -1488,7 +1497,7 @@ class Merryn(discord.Client):
                     ephemeral=True,
                 )
                 return
-            if not is_moderator(interaction.user):
+            if not is_moderator(mover):
                 await interaction.response.send_message(
                     "Only a moderator may force a ballot in an inquorate chamber.",
                     ephemeral=True,
@@ -1499,12 +1508,13 @@ class Merryn(discord.Client):
                 "procedural",
                 f"Ballot on “{text}” forced by chair override — {present} present, "
                 f"{meeting.quorum_size} required for a quorum.",
-                interaction.user.display_name,
+                mover.display_name,
             )
 
         record = MotionRecord(
             text=text,
-            moved_by=interaction.user.display_name,
+            moved_by=mover.display_name,
+            moved_by_id=mover.id,
             pass_threshold=pass_threshold,
             quorum_size=meeting.quorum_size if meeting.quorum_active() else 0,
             quorum_override=override_used,
@@ -1566,6 +1576,14 @@ class Merryn(discord.Client):
             )
             return
 
+        mover = interaction.guild.get_member(view.mover_id)
+        if mover is None:
+            await interaction.response.send_message(
+                "The mover is no longer in this server, so the motion lapses.",
+                ephemeral=True,
+            )
+            return
+
         view.stop()
         if view.message is not None:
             try:
@@ -1583,6 +1601,7 @@ class Merryn(discord.Client):
             view.pass_threshold,
             override=view.override,
             seconded_by=member.display_name,
+            mover=mover,
         )
 
     async def update_ballot_tally(
@@ -1613,6 +1632,62 @@ class Merryn(discord.Client):
             "🔨 The chair has closed the ballot early."
         )
         await self._finalise_motion(view, closed_early=True)
+
+    async def handle_motion_withdraw(
+        self, interaction: discord.Interaction, view: MotionView
+    ) -> None:
+        """The mover (or a moderator) withdraws a motion before any vote.
+
+        Once a vote is cast the ballot can only be closed, never withdrawn,
+        so nobody can make a vote going against them disappear.
+        """
+        record = view.record
+        if view.is_finished() or record.outcome != "open":
+            await interaction.response.send_message(
+                "The ballot has already closed.", ephemeral=True
+            )
+            return
+        if not (
+            record.moved_by_id == interaction.user.id
+            or is_moderator(interaction.user)
+        ):
+            await interaction.response.send_message(
+                "Only the mover or a moderator may withdraw a motion.",
+                ephemeral=True,
+            )
+            return
+        if view.votes:
+            await interaction.response.send_message(
+                "Votes have already been cast, so the motion can no longer be "
+                "withdrawn. The chair may close the ballot early instead.",
+                ephemeral=True,
+            )
+            return
+        # Set before any await, so a vote or the close timer arriving in
+        # between finds the ballot already settled.
+        record.outcome = "withdrawn"
+        view.stop()
+        if view.close_task is not None:
+            view.close_task.cancel()
+        if self._open_ballots.get(view.guild_id) is view:
+            self._open_ballots.pop(view.guild_id, None)
+        self.registry.save()
+        await interaction.response.send_message(
+            f"↩️ **{interaction.user.display_name}** has withdrawn the motion."
+        )
+        guild = self.get_guild(view.guild_id)
+        if guild is not None:
+            await self._stop_ballot_ambience(self.registry.get(view.guild_id), guild)
+        embed = discord.Embed(
+            title="Motion — withdrawn",
+            description=record.text,
+            colour=discord.Colour.dark_grey(),
+        )
+        embed.add_field(name="Result: WITHDRAWN", value="Withdrawn before any vote was cast.")
+        try:
+            await view.message.edit(embed=embed, view=None)
+        except discord.HTTPException as exc:
+            log.warning("Could not close withdrawn motion message: %s", exc)
 
     async def _close_motion_later(self, view: MotionView, seconds: int) -> None:
         await asyncio.sleep(seconds)
@@ -2171,6 +2246,127 @@ async def agenda_clear(interaction: discord.Interaction) -> None:
     )
 
 
+@agenda_group.command(
+    name="edit",
+    description="Reword an agenda item: an upcoming live item, or a backlog item between meetings",
+)
+@app_commands.describe(
+    number="Item number as shown by /agenda show",
+    text="The new wording",
+)
+async def agenda_edit(
+    interaction: discord.Interaction,
+    number: app_commands.Range[int, 1, 999],
+    text: str,
+) -> None:
+    bot: Merryn = interaction.client
+    text = text.strip()
+    if not text:
+        await interaction.response.send_message(
+            "An agenda item cannot be empty.", ephemeral=True
+        )
+        return
+    meeting = bot.registry.get(interaction.guild_id)
+    if meeting is None:
+        backlog = bot.continuity.backlog_items(interaction.guild_id)
+        if not 1 <= number <= len(backlog):
+            await interaction.response.send_message(
+                f"There is no backlog item {number}.", ephemeral=True
+            )
+            return
+        if not (
+            is_moderator(interaction.user)
+            or backlog[number - 1].submitted_by_id == interaction.user.id
+        ):
+            await interaction.response.send_message(
+                "Only a moderator or the member who proposed it may reword a backlog item.",
+                ephemeral=True,
+            )
+            return
+        old = bot.continuity.edit_backlog(interaction.guild_id, number - 1, text)
+        await interaction.response.send_message(
+            f"✏️ Backlog item {number} reworded.\nWas: {old}\nNow: **{text}**"
+        )
+        return
+    if not await bot._require_moderator(interaction):
+        return
+    old = meeting.edit_agenda_item(number - 1, text)
+    if old is None:
+        first = meeting.first_upcoming_index() + 1
+        reason = (
+            "it has already been reached, so it keeps the wording the minutes recorded"
+            if number < first and number <= len(meeting.agenda)
+            else f"there is no item {number}"
+        )
+        await interaction.response.send_message(
+            f"Item {number} cannot be reworded: {reason}.", ephemeral=True
+        )
+        return
+    bot.registry.save()
+    await interaction.response.send_message(
+        f"✏️ Item {number} reworded.\nWas: {old}\nNow: **{text}**"
+    )
+    await bot.refresh_panel(meeting)
+
+
+@agenda_group.command(
+    name="move",
+    description="Move an agenda item to a new position: upcoming live items, or the backlog",
+)
+@app_commands.describe(
+    number="Item number as shown by /agenda show",
+    to="The position it should move to",
+)
+async def agenda_move(
+    interaction: discord.Interaction,
+    number: app_commands.Range[int, 1, 999],
+    to: app_commands.Range[int, 1, 999],
+) -> None:
+    bot: Merryn = interaction.client
+    if not await bot._require_moderator(interaction):
+        return
+    if number == to:
+        await interaction.response.send_message(
+            f"Item {number} is already in that position.", ephemeral=True
+        )
+        return
+    meeting = bot.registry.get(interaction.guild_id)
+    if meeting is None:
+        count = len(bot.continuity.backlog_items(interaction.guild_id))
+        item = bot.continuity.move_backlog(interaction.guild_id, number - 1, to - 1)
+        if item is None:
+            await interaction.response.send_message(
+                f"The backlog has {count} item{'s' if count != 1 else ''}, so "
+                f"item {number} cannot move to position {to}.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            f"↕️ Moved **{item.text}** to position {to} in the backlog."
+        )
+        return
+    item = meeting.move_agenda_item(number - 1, to - 1)
+    if item is None:
+        first = meeting.first_upcoming_index() + 1
+        total = len(meeting.agenda)
+        span = (
+            f"items {first} to {total}" if first < total
+            else f"item {first}" if first == total
+            else "none"
+        )
+        await interaction.response.send_message(
+            "Only upcoming items can move, and only among themselves "
+            f"(currently {span}). Items already reached stay where the minutes put them.",
+            ephemeral=True,
+        )
+        return
+    bot.registry.save()
+    await interaction.response.send_message(
+        f"↕️ Moved **{item.text}** to position {to} on the agenda."
+    )
+    await bot.refresh_panel(meeting)
+
+
 quorum_group = app_commands.Group(
     name="quorum",
     description="Set how many members must be present for a ballot",
@@ -2507,6 +2703,64 @@ async def remind_command(
     )
 
 
+reminders_group = app_commands.Group(
+    name="reminders", description="Your own pending /remind reminders"
+)
+
+
+@reminders_group.command(name="list", description="Show your pending reminders")
+async def reminders_list(interaction: discord.Interaction) -> None:
+    bot: Merryn = interaction.client
+    items = bot.continuity.personal_reminders_for(interaction.user.id)
+    if not items:
+        await interaction.response.send_message(
+            "You have no pending reminders.", ephemeral=True
+        )
+        return
+    lines = ["**Your reminders:**"]
+    for i, r in enumerate(items, 1):
+        when = int(datetime.fromisoformat(r.fire_at).timestamp())
+        text = r.text if len(r.text) <= 150 else r.text[:149] + "…"
+        lines.append(f"{i}. <t:{when}:R> — {text}")
+    lines.append("`/reminders cancel 1, 3` cancels by number.")
+    await interaction.response.send_message(
+        "\n".join(lines)[:2000], ephemeral=True
+    )
+
+
+@reminders_group.command(name="cancel", description="Cancel one or more of your reminders")
+@app_commands.describe(
+    items="Reminder numbers as shown by /reminders list, e.g. '2', '1, 3' or '1-4'"
+)
+async def reminders_cancel(interaction: discord.Interaction, items: str) -> None:
+    bot: Merryn = interaction.client
+    numbers = parse_item_numbers(items)
+    if numbers is None:
+        await interaction.response.send_message(
+            "I could not read those numbers. Try `2`, `1, 3` or `1-4`.",
+            ephemeral=True,
+        )
+        return
+    pending = bot.continuity.personal_reminders_for(interaction.user.id)
+    missing = [n for n in numbers if n > len(pending)]
+    if missing:
+        await interaction.response.send_message(
+            f"You have no reminder {', '.join(map(str, missing))} "
+            f"({len(pending)} pending), so nothing was cancelled.",
+            ephemeral=True,
+        )
+        return
+    for n in numbers:
+        bot.continuity.pop_personal_reminder(pending[n - 1].id)
+    await interaction.response.send_message(
+        _removed_summary(
+            f"🔕 Cancelled {len(numbers)} reminder{'s' if len(numbers) != 1 else ''}:",
+            [pending[n - 1] for n in numbers],
+        ),
+        ephemeral=True,
+    )
+
+
 @app_commands.command(
     name="holdmusic",
     description="Merryn joins your voice channel and plays hold music — no one is muted",
@@ -2615,7 +2869,8 @@ def build_help_embed(moderator: bool) -> discord.Embed:
         value=(
             "`/motion <text>` — open a ballot; anyone in the voice channel "
             "may move one. Add `seconds:` for a longer ballot, or `pass:75` "
-            "to require a supermajority.\n"
+            "to require a supermajority. Changed your mind? Press ↩️ "
+            "*Withdraw* on the ballot before anyone votes.\n"
             "If this server requires a second (`/second show` says so), the "
             "motion waits — press *Second this motion* on Merryn's post, or "
             "the mover names one with `second:@member`.\n"
@@ -2641,7 +2896,8 @@ def build_help_embed(moderator: bool) -> discord.Embed:
         value=(
             "`/remind text: duration:` — a personal reminder (e.g. `10m`, "
             "`1h30m`, `2d`), by DM if I can, or in-channel if I cannot. "
-            "Not tied to meetings — usable any time."
+            "Not tied to meetings — usable any time. `/reminders list` shows "
+            "yours; `/reminders cancel 1, 3` drops them."
         ),
         inline=False,
     )
@@ -2697,7 +2953,9 @@ def build_help_embed(moderator: bool) -> discord.Embed:
                 "their item gives them the floor and pings them. "
                 "`/agenda drop 2, 4-6` removes several items at once; "
                 "`/agenda clear` empties the backlog, or the rest of a live "
-                "agenda (items already reached stay in the minutes)."
+                "agenda (items already reached stay in the minutes). "
+                "`/agenda edit <n> <text>` rewords an upcoming item; "
+                "`/agenda move <n> <to>` reorders one."
             ),
             inline=False,
         )
