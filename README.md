@@ -28,7 +28,8 @@ meetings need a firm but fair chair.
   they are not.
 - **Agenda backlog (between meetings)** — with no meeting in session,
   *anyone* can `/agenda add` to propose an item for next time. The
-  backlog is listed by `/agenda show`, tidied with `/agenda drop`, and
+  backlog is listed by `/agenda show`, tidied with `/agenda drop`
+  (several at once, e.g. `/agenda drop 2, 4-6`) or `/agenda clear`, and
   pulled into the agenda automatically when the next meeting opens.
 - **Outstanding actions carry over** — action items recorded with
   `/action` survive the meeting's close. The next meeting opens by
@@ -209,7 +210,9 @@ directory Merryn is started from (see `.env.example`):
 | `/second show` | anyone | Whether seconding is currently required |
 | `/agenda add [owner]` | anyone between meetings, moderator during one | Add an item to the live agenda, or to the next meeting's backlog if none is in session |
 | `/agenda assign` · `/agenda next` | moderator | Assign a presenter; advance the agenda |
-| `/agenda show` · `/agenda drop <n>` | anyone (drop: proposer or moderator) | Show the agenda/backlog; remove a backlog item |
+| `/agenda show` | anyone | Show the live agenda, or the backlog between meetings |
+| `/agenda drop <items>` | moderator in a meeting; proposer or moderator between meetings | Remove one or more items, e.g. `3`, `1, 4, 6` or `2-5`. Live: upcoming items only |
+| `/agenda clear` | moderator | Clear the rest of the live agenda, or the whole backlog between meetings (asks to confirm) |
 | `/actions list` · `/actions done <n>` | anyone (done: moderator) | Outstanding actions carried between meetings |
 | `/floor give <member>` | moderator | Give the floor directly, bypassing the queue |
 | `/note <text>` | anyone | Record a note in the minutes |

@@ -292,6 +292,26 @@ class Meeting:
         item.owner_name = owner_name
         return item
 
+    def first_upcoming_index(self) -> int:
+        """0-based index of the first agenda item not yet reached.
+
+        Items before this have a start time in agenda_started and may be
+        referenced by log entries, so only items from here on can be
+        removed without the minutes attributing notes to the wrong item.
+        """
+        if self.agenda_index is None:
+            return 0
+        return min(self.agenda_index + 1, len(self.agenda))
+
+    def drop_agenda_items(self, indices: list[int]) -> list[AgendaItem]:
+        """Removes upcoming items at the given 0-based indices; returns them
+        in list order. Reached or out-of-range indices are ignored."""
+        start = self.first_upcoming_index()
+        wanted = {i for i in indices if start <= i < len(self.agenda)}
+        removed = [item for i, item in enumerate(self.agenda) if i in wanted]
+        self.agenda = [item for i, item in enumerate(self.agenda) if i not in wanted]
+        return removed
+
     # --- quorum -----------------------------------------------------------
 
     def quorum_active(self) -> bool:

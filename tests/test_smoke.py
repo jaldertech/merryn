@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from merryn import audio, meeting, minutes, views  # noqa: F401
 from merryn.audio import FRAME_BYTES, LoopingWAVAudio, resolve_hold_music
 from merryn.meeting import Meeting, MotionRecord
-from merryn.store import ContinuityStore, GuildSettings
+from merryn.store import BacklogItem, ContinuityStore, GuildSettings
 
 
 def test_hold_music_loops():
@@ -183,6 +183,51 @@ def test_reminder_persistence():
     print("reminder persistence OK")
 
 
+def test_item_numbers_parse():
+    p = minutes.parse_item_numbers
+    assert p("3") == [3]
+    assert p("1, 4, 6") == [1, 4, 6]
+    assert p("2-5") == [2, 3, 4, 5]
+    assert p("2 - 4, 8") == [2, 3, 4, 8]
+    assert p("5 1 1") == [1, 5]
+    assert p("") is None
+    assert p("0") is None
+    assert p("5-2") is None
+    assert p("two") is None
+    print("item numbers parse OK")
+
+
+def test_backlog_bulk_drop():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "continuity.json"
+        store = ContinuityStore(path)
+        for text in "abcde":
+            store.add_backlog(1, BacklogItem(text=text, submitted_by="x", submitted_by_id=9))
+        removed = store.drop_backlog(1, [0, 2, 4, 99])
+        assert [i.text for i in removed] == ["a", "c", "e"]
+        assert [i.text for i in ContinuityStore.load(path).backlog_items(1)] == ["b", "d"]
+        assert len(store.drop_backlog(1, [0, 1])) == 2
+        assert store.backlog_items(1) == []
+    print("backlog bulk drop OK")
+
+
+def test_live_agenda_drop_keeps_reached_items():
+    m = Meeting(
+        guild_id=1, text_channel_id=1, voice_channel_id=1, mode="advisory",
+        started_by_id=1, started_by_name="x",
+    )
+    for text in "abcde":
+        m.add_agenda_item(text)
+    m.advance_agenda()  # on "b": a and b are reached
+    assert m.first_upcoming_index() == 2
+    removed = m.drop_agenda_items([0, 1, 3])
+    assert [i.text for i in removed] == ["d"]
+    assert [i.text for i in m.agenda] == ["a", "b", "c", "e"]
+    assert m.current_agenda_item().text == "b" and len(m.agenda_started) == 2
+    assert [i.text for i in m.drop_agenda_items(list(range(4)))] == ["c", "e"]
+    print("live agenda drop OK")
+
+
 def test_update_is_newer():
     from merryn.update import is_newer
 
@@ -215,6 +260,9 @@ if __name__ == "__main__":
     test_duration_parse()
     test_chunk_for_discord()
     test_reminder_persistence()
+    test_item_numbers_parse()
+    test_backlog_bulk_drop()
+    test_live_agenda_drop_keeps_reached_items()
     test_update_is_newer()
     test_version_single_sourced()
     print("all smoke tests passed")
