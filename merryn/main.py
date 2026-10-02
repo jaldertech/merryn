@@ -42,6 +42,7 @@ from .minutes import (
     local,
     local_date,
     parse_duration,
+    parse_item_numbers,
     parse_local_datetime,
 )
 from .store import (
@@ -52,7 +53,13 @@ from .store import (
     PersonalReminder,
 )
 from .update import is_newer
-from .views import ConfirmAdjournView, MotionView, PanelView, SecondView
+from .views import (
+    ConfirmAdjournView,
+    ConfirmClearAgendaView,
+    MotionView,
+    PanelView,
+    SecondView,
+)
 
 log = logging.getLogger("merryn")
 
@@ -922,6 +929,39 @@ class Merryn(discord.Client):
             view=ConfirmAdjournView(self),
             ephemeral=True,
         )
+
+    async def clear_agenda(self, interaction: discord.Interaction) -> None:
+        """Clears the live meeting's upcoming items, or the whole backlog
+        between meetings. Called from ConfirmClearAgendaView."""
+        if not await self._require_moderator(interaction):
+            return
+        meeting = self.registry.get(interaction.guild_id)
+        if meeting is None:
+            count = len(self.continuity.backlog_items(interaction.guild_id))
+            removed = self.continuity.drop_backlog(interaction.guild_id, list(range(count)))
+            if not removed:
+                await interaction.response.send_message(
+                    "The agenda backlog is already empty.", ephemeral=True
+                )
+                return
+            await interaction.response.send_message(
+                f"🗑️ Cleared the agenda backlog ({len(removed)} "
+                f"item{'s' if len(removed) != 1 else ''} removed)."
+            )
+            return
+        removed = meeting.drop_agenda_items(list(range(len(meeting.agenda))))
+        if not removed:
+            await interaction.response.send_message(
+                "There are no upcoming agenda items to clear.", ephemeral=True
+            )
+            return
+        self.registry.save()
+        await interaction.response.send_message(
+            f"🗑️ Cleared the remaining agenda ({len(removed)} "
+            f"item{'s' if len(removed) != 1 else ''} removed). Items already "
+            "reached stay in the minutes."
+        )
+        await self.refresh_panel(meeting)
 
     async def open_meeting(
         self,
@@ -1994,38 +2034,140 @@ async def agenda_show(interaction: discord.Interaction) -> None:
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
+def _removed_summary(header: str, removed: list) -> str:
+    """Header plus a bullet per removed item, kept under Discord's 2000-char
+    message limit by summarising the tail."""
+    lines = [header]
+    for i, item in enumerate(removed):
+        text = item.text if len(item.text) <= 200 else item.text[:199] + "…"
+        line = f"• {text}"
+        tail = f"…and {len(removed) - i} more."
+        if sum(len(x) + 1 for x in lines) + len(line) + len(tail) + 2 > 1900:
+            lines.append(tail)
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
 @agenda_group.command(
-    name="drop", description="Remove an item from the next meeting's agenda backlog"
+    name="drop",
+    description="Remove one or more items from the live agenda, or from the backlog between meetings",
 )
-@app_commands.describe(number="Backlog item number as shown by /agenda show")
-async def agenda_drop(
-    interaction: discord.Interaction, number: app_commands.Range[int, 1, 99]
-) -> None:
+@app_commands.describe(
+    items="Item numbers as shown by /agenda show, e.g. '3', '1, 4, 6' or '2-5'"
+)
+async def agenda_drop(interaction: discord.Interaction, items: str) -> None:
     bot: Merryn = interaction.client
-    items = bot.continuity.backlog_items(interaction.guild_id)
-    if not items:
+    numbers = parse_item_numbers(items)
+    if numbers is None:
         await interaction.response.send_message(
-            "The agenda backlog is empty.", ephemeral=True
-        )
-        return
-    if number > len(items):
-        await interaction.response.send_message(
-            f"There is no backlog item {number}.", ephemeral=True
-        )
-        return
-    target = items[number - 1]
-    if not (
-        is_moderator(interaction.user)
-        or target.submitted_by_id == interaction.user.id
-    ):
-        await interaction.response.send_message(
-            "Only a moderator or the member who proposed it may remove a backlog item.",
+            "I could not read those item numbers. Try `3`, `1, 4, 6` or `2-5`.",
             ephemeral=True,
         )
         return
-    removed = bot.continuity.drop_backlog(interaction.guild_id, number - 1)
+    plural = "s" if len(numbers) != 1 else ""
+    meeting = bot.registry.get(interaction.guild_id)
+
+    if meeting is None:
+        backlog = bot.continuity.backlog_items(interaction.guild_id)
+        if not backlog:
+            await interaction.response.send_message(
+                "The agenda backlog is empty.", ephemeral=True
+            )
+            return
+        missing = [n for n in numbers if n > len(backlog)]
+        if missing:
+            await interaction.response.send_message(
+                f"There is no backlog item {', '.join(map(str, missing))}. "
+                f"The backlog has {len(backlog)} item{'s' if len(backlog) != 1 else ''}.",
+                ephemeral=True,
+            )
+            return
+        # All or nothing: a partial drop would renumber the rest and leave
+        # the member unsure which of their numbers still apply.
+        if not is_moderator(interaction.user):
+            not_theirs = [
+                n for n in numbers
+                if backlog[n - 1].submitted_by_id != interaction.user.id
+            ]
+            if not_theirs:
+                await interaction.response.send_message(
+                    "Only a moderator or the member who proposed it may remove a "
+                    f"backlog item. You did not propose item{'s' if len(not_theirs) != 1 else ''} "
+                    f"{', '.join(map(str, not_theirs))}, so nothing was removed.",
+                    ephemeral=True,
+                )
+                return
+        removed = bot.continuity.drop_backlog(
+            interaction.guild_id, [n - 1 for n in numbers]
+        )
+        await interaction.response.send_message(
+            _removed_summary(f"🗑️ Removed {len(removed)} item{plural} from the backlog:", removed)
+        )
+        return
+
+    # A meeting is in session: only moderators may edit the live agenda.
+    if not await bot._require_moderator(interaction):
+        return
+    first = meeting.first_upcoming_index() + 1  # 1-based
+    reached = [n for n in numbers if n < first]
+    missing = [n for n in numbers if n > len(meeting.agenda)]
+    if reached or missing:
+        problems = []
+        if reached:
+            problems.append(
+                f"item{'s' if len(reached) != 1 else ''} {', '.join(map(str, reached))} "
+                "already reached (they stay in the minutes)"
+            )
+        if missing:
+            problems.append(
+                f"no item {', '.join(map(str, missing))} on an agenda of {len(meeting.agenda)}"
+            )
+        await interaction.response.send_message(
+            f"Nothing was removed: {'; '.join(problems)}.", ephemeral=True
+        )
+        return
+    removed = meeting.drop_agenda_items([n - 1 for n in numbers])
+    bot.registry.save()
     await interaction.response.send_message(
-        f"🗑️ Removed from the backlog: **{removed.text}**"
+        _removed_summary(f"🗑️ Removed {len(removed)} item{plural} from the agenda:", removed)
+    )
+    await bot.refresh_panel(meeting)
+
+
+@agenda_group.command(
+    name="clear",
+    description="Clear the remaining live agenda, or the whole backlog between meetings",
+)
+async def agenda_clear(interaction: discord.Interaction) -> None:
+    bot: Merryn = interaction.client
+    if not await bot._require_moderator(interaction):
+        return
+    meeting = bot.registry.get(interaction.guild_id)
+    if meeting is None:
+        count = len(bot.continuity.backlog_items(interaction.guild_id))
+        if not count:
+            await interaction.response.send_message(
+                "The agenda backlog is already empty.", ephemeral=True
+            )
+            return
+        prompt = (
+            f"Clear all {count} item{'s' if count != 1 else ''} from the agenda "
+            "backlog? This includes items other members proposed."
+        )
+    else:
+        count = len(meeting.agenda) - meeting.first_upcoming_index()
+        if not count:
+            await interaction.response.send_message(
+                "There are no upcoming agenda items to clear.", ephemeral=True
+            )
+            return
+        prompt = (
+            f"Clear the {count} upcoming agenda item{'s' if count != 1 else ''}? "
+            "Items already reached stay in the minutes."
+        )
+    await interaction.response.send_message(
+        prompt, view=ConfirmClearAgendaView(bot), ephemeral=True
     )
 
 
@@ -2488,7 +2630,8 @@ def build_help_embed(moderator: bool) -> discord.Embed:
         name="Between meetings",
         value=(
             "`/agenda add <text>` — anyone may propose an item for the next "
-            "meeting; it pre-populates the agenda automatically.\n"
+            "meeting; it pre-populates the agenda automatically. "
+            "`/agenda drop 2, 4-6` removes your own items in one go.\n"
             "`/actions list` — outstanding actions carried forward."
         ),
         inline=False,
@@ -2551,7 +2694,10 @@ def build_help_embed(moderator: bool) -> discord.Embed:
                 "`/actions done`.\n"
                 "`/timer <seconds>` warns you when a speaker runs long (nobody "
                 "is cut off). `/agenda assign` names a presenter; advancing to "
-                "their item gives them the floor and pings them."
+                "their item gives them the floor and pings them. "
+                "`/agenda drop 2, 4-6` removes several items at once; "
+                "`/agenda clear` empties the backlog, or the rest of a live "
+                "agenda (items already reached stay in the minutes)."
             ),
             inline=False,
         )

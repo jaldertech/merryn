@@ -153,14 +153,18 @@ class ContinuityStore:
         self.save()
         return len(items)
 
-    def drop_backlog(self, guild_id: int, index: int) -> BacklogItem | None:
-        """Removes the backlog item at a 0-based index; returns it, or None
-        if the index is out of range."""
+    def drop_backlog(self, guild_id: int, indices: list[int]) -> list[BacklogItem]:
+        """Removes the backlog items at the given 0-based indices in one go;
+        returns them in list order. Out-of-range indices are ignored."""
         items = self.backlog.get(guild_id, [])
-        if index < 0 or index >= len(items):
-            return None
-        removed = items.pop(index)
-        if not items:
+        wanted = {i for i in indices if 0 <= i < len(items)}
+        if not wanted:
+            return []
+        removed = [item for i, item in enumerate(items) if i in wanted]
+        kept = [item for i, item in enumerate(items) if i not in wanted]
+        if kept:
+            self.backlog[guild_id] = kept
+        else:
             self.backlog.pop(guild_id, None)
         self.save()
         return removed

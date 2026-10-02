@@ -109,6 +109,31 @@ def parse_duration(value: str) -> int | None:
     return sum(int(v) * DURATION_UNITS[k] for k, v in parts.items() if v)
 
 
+ITEM_NUMBER_PATTERN = re.compile(r"^(\d+)(?:-(\d+))?$")
+
+
+def parse_item_numbers(value: str) -> list[int] | None:
+    """Parses '3', '1, 4, 6' or '2-5, 8' into sorted unique 1-based numbers.
+
+    Commas or spaces separate entries. None if any part cannot be read,
+    a range runs backwards, or a number is zero.
+    """
+    numbers: set[int] = set()
+    normalised = re.sub(r"\s*-\s*", "-", value.strip())
+    for part in re.split(r"[,\s]+", normalised):
+        if not part:
+            continue
+        match = ITEM_NUMBER_PATTERN.fullmatch(part)
+        if match is None:
+            return None
+        low = int(match.group(1))
+        high = int(match.group(2) or low)
+        if low < 1 or high < low or high > 999:
+            return None
+        numbers.update(range(low, high + 1))
+    return sorted(numbers) or None
+
+
 def build_minutes(meeting: Meeting, ended_at: str | None = None) -> str:
     ended_at = ended_at or now_iso()
     duration = (iso_to_dt(ended_at) - iso_to_dt(meeting.started_at)).total_seconds()

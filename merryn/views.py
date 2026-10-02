@@ -93,6 +93,21 @@ class ConfirmAdjournView(discord.ui.View):
         await self.bot.end_meeting(interaction)
 
 
+class ConfirmClearAgendaView(discord.ui.View):
+    """Ephemeral confirmation for /agenda clear. The clear itself is
+    re-evaluated on press, so a meeting opening or closing in the 30s
+    between asking and confirming clears whichever list is current."""
+
+    def __init__(self, bot):
+        super().__init__(timeout=30)
+        self.bot = bot
+
+    @discord.ui.button(label="Confirm — clear the agenda", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await self.bot.clear_agenda(interaction)
+
+
 class SecondView(discord.ui.View):
     """Shown for a motion moved under a seconding requirement, until
     another member in the chamber seconds it. The motion never reaches a
