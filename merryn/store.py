@@ -169,6 +169,28 @@ class ContinuityStore:
         self.save()
         return removed
 
+    def edit_backlog(self, guild_id: int, index: int, text: str) -> str | None:
+        """Rewords the backlog item at a 0-based index; returns the old
+        wording, or None if out of range."""
+        items = self.backlog.get(guild_id, [])
+        if not 0 <= index < len(items):
+            return None
+        old = items[index].text
+        items[index].text = text
+        self.save()
+        return old
+
+    def move_backlog(self, guild_id: int, index: int, to: int) -> BacklogItem | None:
+        """Moves the backlog item at index to position to (both 0-based);
+        the backlog's order becomes the next agenda's order."""
+        items = self.backlog.get(guild_id, [])
+        if not (0 <= index < len(items) and 0 <= to < len(items)):
+            return None
+        item = items.pop(index)
+        items.insert(to, item)
+        self.save()
+        return item
+
     def take_backlog(self, guild_id: int) -> list[BacklogItem]:
         """Removes and returns the whole backlog for a guild — called when a
         meeting opens and the backlog is brought forward into its agenda."""
@@ -236,6 +258,14 @@ class ContinuityStore:
     def add_personal_reminder(self, reminder: PersonalReminder) -> None:
         self.personal_reminders.append(reminder)
         self.save()
+
+    def personal_reminders_for(self, user_id: int) -> list[PersonalReminder]:
+        """A member's pending reminders, soonest first. The numbering
+        /reminders list shows is the position in this list."""
+        return sorted(
+            (r for r in self.personal_reminders if r.user_id == user_id),
+            key=lambda r: r.fire_at,
+        )
 
     def pop_personal_reminder(self, reminder_id: str) -> None:
         before = len(self.personal_reminders)

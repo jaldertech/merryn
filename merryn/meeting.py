@@ -78,7 +78,7 @@ class MotionRecord:
     # Abstain was removed from the ballot; the field remains so persisted
     # records that carry an "abstain" key still load via MotionRecord(**m).
     abstain: int = 0
-    outcome: str = "open"  # "carried" | "failed" | "tied" | "open" | "void"
+    outcome: str = "open"  # "carried" | "failed" | "tied" | "open" | "void" | "withdrawn"
     # Percentage of votes cast that must be ayes for the motion to carry.
     # None means the original rule: simple majority (yes > no), tie possible.
     pass_threshold: int | None = None
@@ -96,6 +96,10 @@ class MotionRecord:
     # (in which case the motion never reaches a ballot without one — see
     # SecondView/handle_second_motion).
     seconded_by: str | None = None
+    # Discord id of the mover, so they (not just a moderator) may withdraw
+    # the motion before any vote is cast. None on records saved before
+    # this field existed.
+    moved_by_id: int | None = None
     at: str = field(default_factory=now_iso)
 
     def percent_in_favour(self) -> int | None:
@@ -290,6 +294,26 @@ class Meeting:
         item = self.agenda[index]
         item.owner_id = owner_id
         item.owner_name = owner_name
+        return item
+
+    def edit_agenda_item(self, index: int, text: str) -> str | None:
+        """Rewords the upcoming item at a 0-based index; returns the old
+        wording, or None if the item is reached or out of range. Reached
+        items keep their wording so the minutes match what was discussed."""
+        if not self.first_upcoming_index() <= index < len(self.agenda):
+            return None
+        old = self.agenda[index].text
+        self.agenda[index].text = text
+        return old
+
+    def move_agenda_item(self, index: int, to: int) -> AgendaItem | None:
+        """Moves the upcoming item at 0-based index to position to; both
+        must be upcoming. Returns the moved item, or None if refused."""
+        start = self.first_upcoming_index()
+        if not (start <= index < len(self.agenda) and start <= to < len(self.agenda)):
+            return None
+        item = self.agenda.pop(index)
+        self.agenda.insert(to, item)
         return item
 
     def first_upcoming_index(self) -> int:

@@ -48,6 +48,9 @@ meetings need a firm but fair chair.
   in favour and how many of those present abstained by not voting.
   An optional supermajority can be required per motion:
   `/motion text:"Buy the new marquee" pass:75 seconds:120`.
+  Before anyone votes, the mover or a moderator can press ↩️ *Withdraw*;
+  the minutes record the motion as withdrawn rather than giving a result.
+  Once a vote is cast the ballot can only be closed.
 - **Seconding** — off by default; `/second enable` requires every
   motion to be seconded by a different member in the chamber before it
   reaches a ballot. Name one inline with `/motion ... second:@member`,
@@ -108,7 +111,8 @@ meetings need a firm but fair chair.
   `d`/`h`/`m`/`s`, up to 30 days) has Merryn remind you later, by DM if
   your DMs are open, or by pinging you in the channel you set it from if
   not. Not tied to meetings or server business — usable anywhere, any time.
-  Persisted, so a restart never loses one.
+  Persisted, so a restart never loses one. `/reminders list` shows your
+  pending ones; `/reminders cancel 1, 3` (or `1-4`) cancels them.
 
 ## Quick start
 
@@ -213,6 +217,8 @@ directory Merryn is started from (see `.env.example`):
 | `/agenda show` | anyone | Show the live agenda, or the backlog between meetings |
 | `/agenda drop <items>` | moderator in a meeting; proposer or moderator between meetings | Remove one or more items, e.g. `3`, `1, 4, 6` or `2-5`. Live: upcoming items only |
 | `/agenda clear` | moderator | Clear the rest of the live agenda, or the whole backlog between meetings (asks to confirm) |
+| `/agenda edit <number> <text>` | moderator in a meeting; proposer or moderator between meetings | Reword an item. Live: upcoming items only |
+| `/agenda move <number> <to>` | moderator | Reorder an item. Live: among upcoming items only. Backlog order becomes the next agenda's order |
 | `/actions list` · `/actions done <n>` | anyone (done: moderator) | Outstanding actions carried between meetings |
 | `/floor give <member>` | moderator | Give the floor directly, bypassing the queue |
 | `/note <text>` | anyone | Record a note in the minutes |
@@ -222,6 +228,7 @@ directory Merryn is started from (see `.env.example`):
 | `/holdmusic` | anyone | Merryn joins your voice channel and loops hold music; run again to stop |
 | `/motivation` | anyone | A random word of encouragement |
 | `/remind text: duration:` | anyone | Reminds you later, by DM or in-channel fallback |
+| `/reminders list` · `/reminders cancel <items>` | anyone (own reminders only) | Show or cancel your pending reminders |
 
 "Moderator" = anyone with **Manage Server**, or the role named in
 `MOD_ROLE_ID`.

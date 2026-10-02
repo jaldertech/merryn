@@ -232,6 +232,12 @@ def build_minutes(meeting: Meeting, ended_at: str | None = None) -> str:
                 f", {abst_pct}% abstained" if abst_pct is not None else ""
             )
             seconder_note = f", seconded by {m.seconded_by}" if m.seconded_by else ""
+            if m.outcome == "withdrawn":
+                lines.append(
+                    f"- {local(m.at)} — “{m.text}” (moved by {m.moved_by}{seconder_note}) — "
+                    "**WITHDRAWN** before any vote was cast"
+                )
+                continue
             lines.append(
                 f"- {local(m.at)} — “{m.text}” (moved by {m.moved_by}{seconder_note}) — "
                 f"**{m.outcome.upper()}** (✅ {m.yes} / ❌ {m.no}{pct_note}{abst_note})"

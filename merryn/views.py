@@ -190,3 +190,11 @@ class MotionView(discord.ui.View):
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         await self.bot.handle_ballot_close(interaction, self)
+
+    @discord.ui.button(
+        label="Withdraw", emoji="↩️", style=discord.ButtonStyle.secondary, row=1
+    )
+    async def withdraw(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await self.bot.handle_motion_withdraw(interaction, self)

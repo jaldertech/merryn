@@ -228,6 +228,125 @@ def test_live_agenda_drop_keeps_reached_items():
     print("live agenda drop OK")
 
 
+def _agenda_meeting():
+    m = Meeting(
+        guild_id=1, text_channel_id=1, voice_channel_id=5, mode="advisory",
+        started_by_id=1, started_by_name="x",
+    )
+    for text in "abcde":
+        m.add_agenda_item(text)
+    m.advance_agenda()  # on "b": a and b are reached
+    return m
+
+
+def test_agenda_edit_and_move():
+    m = _agenda_meeting()
+    assert m.edit_agenda_item(1, "z") is None  # reached items keep their wording
+    assert m.edit_agenda_item(3, "D!") == "d" and m.agenda[3].text == "D!"
+    assert m.move_agenda_item(4, 2).text == "e"
+    assert [i.text for i in m.agenda] == ["a", "b", "e", "c", "D!"]
+    assert m.move_agenda_item(3, 1) is None  # cannot move into reached items
+    assert m.current_agenda_item().text == "b"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "continuity.json"
+        store = ContinuityStore(path)
+        for text in "abc":
+            store.add_backlog(1, BacklogItem(text=text, submitted_by="x", submitted_by_id=9))
+        assert store.edit_backlog(1, 1, "B") == "b"
+        assert store.move_backlog(1, 2, 0).text == "c"
+        assert store.move_backlog(1, 0, 7) is None
+        assert [i.text for i in ContinuityStore.load(path).backlog_items(1)] == ["c", "a", "B"]
+    print("agenda edit and move OK")
+
+
+def test_reminders_for_member():
+    from datetime import timedelta, timezone
+
+    from merryn.store import PersonalReminder
+
+    now = datetime.now(timezone.utc)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "continuity.json"
+        store = ContinuityStore(path)
+        for uid, mins, text in [(7, 30, "late"), (8, 5, "other"), (7, 5, "soon")]:
+            store.add_personal_reminder(PersonalReminder(
+                user_id=uid, guild_id=1, channel_id=1, text=text,
+                fire_at=(now + timedelta(minutes=mins)).isoformat(),
+            ))
+        assert [r.text for r in store.personal_reminders_for(7)] == ["soon", "late"]
+        store.pop_personal_reminder(store.personal_reminders_for(7)[0].id)
+        assert [r.text for r in ContinuityStore.load(path).personal_reminders_for(7)] == ["late"]
+        assert [r.text for r in store.personal_reminders_for(8)] == ["other"]
+    print("reminders for member OK")
+
+
+def test_withdraw_and_mover():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from merryn import main as M
+
+    m = _agenda_meeting()
+    m.motions.append(MotionRecord(text="Buy a goat", moved_by="Ann", outcome="withdrawn"))
+    line = [x for x in minutes.build_minutes(m).splitlines() if "goat" in x][0]
+    assert "WITHDRAWN" in line and "✅" not in line
+
+    def member(uid):
+        x = MagicMock()
+        x.id, x.display_name = uid, f"u{uid}"
+        return x
+
+    async def withdraw(user, mod, votes):
+        bot = M.client
+        rec = MotionRecord(text="t", moved_by="u1", moved_by_id=1)
+        view = MagicMock()
+        view.record, view.votes, view.guild_id = rec, votes, 1
+        view.is_finished.return_value = False
+        view.message.edit = AsyncMock()
+        inter = MagicMock()
+        inter.user = user
+        inter.response.send_message = AsyncMock()
+        with patch.object(M, "is_moderator", return_value=mod), \
+             patch.object(bot, "_stop_ballot_ambience", AsyncMock()), \
+             patch.object(bot.registry, "save"), \
+             patch.object(bot, "get_guild", return_value=MagicMock()):
+            await bot.handle_motion_withdraw(inter, view)
+        return rec.outcome
+
+    async def run():
+        assert await withdraw(member(1), False, {}) == "withdrawn"  # mover
+        assert await withdraw(member(2), False, {}) == "open"  # someone else
+        assert await withdraw(member(2), True, {}) == "withdrawn"  # moderator
+        assert await withdraw(member(1), True, {3: "aye"}) == "open"  # votes cast
+
+        # A seconded motion records the real mover, and an inquorate
+        # override is judged on the mover's rights, not the seconder's.
+        bot = M.client
+        bot._open_ballots.clear()
+        mtg = _agenda_meeting()
+        mtg.quorum_enabled, mtg.quorum_size = True, 10
+        mover, seconder = member(1), member(2)
+        inter = MagicMock()
+        inter.user, inter.guild_id = seconder, 1
+        inter.response.send_message = AsyncMock()
+        inter.original_response = AsyncMock(return_value=MagicMock())
+        with patch.object(M, "is_moderator", side_effect=lambda u: u is mover), \
+             patch.object(bot, "_eligible_voter_count", return_value=3), \
+             patch.object(bot, "_start_ballot_ambience", AsyncMock()), \
+             patch.object(bot, "build_ballot_embed", return_value=None), \
+             patch.object(bot, "_close_motion_later", AsyncMock()), \
+             patch.object(bot.registry, "save"):
+            await bot.open_motion(
+                inter, mtg, "Forced", 60, override=True, seconded_by="u2", mover=mover
+            )
+        rec = mtg.motions[-1]
+        assert (rec.moved_by, rec.moved_by_id, rec.seconded_by) == ("u1", 1, "u2")
+        assert rec.quorum_override
+
+    asyncio.run(run())
+    print("withdraw and mover OK")
+
+
 def test_update_is_newer():
     from merryn.update import is_newer
 
@@ -263,6 +382,9 @@ if __name__ == "__main__":
     test_item_numbers_parse()
     test_backlog_bulk_drop()
     test_live_agenda_drop_keeps_reached_items()
+    test_agenda_edit_and_move()
+    test_reminders_for_member()
+    test_withdraw_and_mover()
     test_update_is_newer()
     test_version_single_sourced()
     print("all smoke tests passed")
