@@ -403,6 +403,19 @@ def test_second_and_failed_ballot_leave_no_trace():
     print("second refusal and failed ballot OK")
 
 
+def test_point_of_order_floor():
+    m = _agenda_meeting()
+    assert m.raise_point_of_order(7, "Ann")
+    _, turn = m.give_floor(7, "Ann")
+    assert turn.point_of_order and m.queue == []
+    # The speaker cannot queue a point of order behind themselves.
+    assert not m.raise_point_of_order(7, "Ann")
+    assert m.queue == []
+    _, plain = m.give_floor(8, "Bob")
+    assert not plain.point_of_order
+    print("point of order floor OK")
+
+
 def test_restart_voids_open_motions():
     from merryn.meeting import Registry
 
@@ -461,6 +474,7 @@ if __name__ == "__main__":
     test_withdraw_and_mover()
     test_second_and_failed_ballot_leave_no_trace()
     test_restart_voids_open_motions()
+    test_point_of_order_floor()
     test_update_is_newer()
     test_version_single_sourced()
     print("all smoke tests passed")

@@ -848,6 +848,11 @@ class Merryn(discord.Client):
                 "Join the meeting voice channel first.", ephemeral=True
             )
             return
+        if meeting.current and meeting.current.user_id == member.id:
+            await interaction.response.send_message(
+                "You already hold the floor.", ephemeral=True
+            )
+            return
         if not meeting.raise_point_of_order(member.id, member.display_name):
             await interaction.response.send_message(
                 "Your point of order is already pending.", ephemeral=True
