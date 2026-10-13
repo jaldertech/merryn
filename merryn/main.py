@@ -216,7 +216,16 @@ class Merryn(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
         intents.members = True  # needed to see who is in the voice channel
-        super().__init__(intents=intents)
+        # Member-written text is echoed back all over (notes, decisions,
+        # agenda items, motions, reminders), so never let it ping @everyone,
+        # @here or a role. A send that genuinely needs one can pass its own
+        # allowed_mentions.
+        super().__init__(
+            intents=intents,
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False, roles=False, users=True, replied_user=True
+            ),
+        )
         self.tree = MerrynCommandTree(self)
         self.registry: Registry = Registry(DATA_DIR / "state.json")
         self.continuity: ContinuityStore = ContinuityStore(DATA_DIR / "continuity.json")
