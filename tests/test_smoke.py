@@ -347,6 +347,146 @@ def test_withdraw_and_mover():
     print("withdraw and mover OK")
 
 
+def test_second_and_failed_ballot_leave_no_trace():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    import discord
+
+    from merryn import main as M
+
+    async def run():
+        bot = M.client
+        mtg = _agenda_meeting()
+
+        # A second pressed while another ballot is open is refused, and the
+        # Second button stays live for later.
+        busy = MagicMock()
+        busy.is_finished.return_value = False
+        bot._open_ballots[1] = busy
+        view = MagicMock()
+        view.is_finished.return_value = False
+        view.seconding = False
+        view.voice_channel_id, view.mover_id = 5, 1
+        view.motion_text, view.motion_seconds = "Buy a goat", 60
+        view.pass_threshold, view.override = None, False
+        view.message.edit = AsyncMock()
+        seconder = MagicMock()
+        seconder.id, seconder.display_name = 2, "u2"
+        seconder.voice.channel.id = 5
+        inter = MagicMock()
+        inter.user, inter.guild_id = seconder, 1
+        inter.response.send_message = AsyncMock()
+        with patch.object(bot.registry, "get", return_value=mtg):
+            await bot.handle_second_motion(inter, view)
+        view.stop.assert_not_called()
+        view.message.edit.assert_not_called()
+        assert not view.seconding and mtg.motions == []
+
+        # A ballot whose post fails leaves no open motion in the minutes.
+        bot._open_ballots.clear()
+        inter = MagicMock()
+        inter.user, inter.guild_id = seconder, 1
+        inter.response.send_message = AsyncMock(
+            side_effect=discord.HTTPException(MagicMock(status=500), "boom")
+        )
+        with patch.object(bot, "_eligible_voter_count", return_value=3), \
+             patch.object(bot, "build_ballot_embed", return_value=None), \
+             patch.object(bot.registry, "save"):
+            try:
+                await bot.open_motion(inter, mtg, "Buy a goat", 60)
+            except discord.HTTPException:
+                pass
+        assert mtg.motions == [] and 1 not in bot._open_ballots
+
+    asyncio.run(run())
+    print("second refusal and failed ballot OK")
+
+
+def test_rejoin_residual_mute():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from merryn import main as M
+    from merryn.meeting import Registry
+
+    async def rejoin(mode, remute_ok, ballot=False, mod=False):
+        bot = M.client
+        with tempfile.TemporaryDirectory() as d:
+            reg = Registry(Path(d) / "state.json")
+        reg.save = lambda: None
+        mtg = _agenda_meeting()
+        mtg.mode = mode
+        reg.meetings[1] = mtg
+        reg.residual_mutes[1] = {7}
+        bot._open_ballots.clear()
+        if ballot:
+            open_view = MagicMock()
+            open_view.is_finished.return_value = False
+            bot._open_ballots[1] = open_view
+        member = MagicMock()
+        member.bot, member.id, member.guild.id = False, 7, 1
+        before, after = MagicMock(), MagicMock()
+        before.channel, after.channel.id = None, 5
+        calls = []
+
+        async def set_mute(_m, mute):
+            calls.append(mute)
+            return remute_ok if mute else True
+
+        with patch.object(bot, "registry", reg), \
+             patch.object(bot, "try_set_mute", side_effect=set_mute), \
+             patch.object(M, "is_moderator", return_value=mod), \
+             patch.object(bot, "refresh_panel", AsyncMock()):
+            await bot.on_voice_state_update(member, before, after)
+        bot._open_ballots.clear()
+        return calls, 7 in reg.residual_mutes[1]
+
+    async def run():
+        # Strict or mid-ballot: never unmuted, even if the re-mute fails;
+        # the ledger keeps them until the meeting tracks the mute itself.
+        assert await rejoin(M.MODE_STRICT, False) == ([True], True)
+        assert await rejoin(M.MODE_STRICT, True) == ([True], False)
+        assert await rejoin(M.MODE_ADVISORY, False, ballot=True) == ([True], True)
+        # Nothing wants them muted: the leftover mute is lifted.
+        assert await rejoin(M.MODE_ADVISORY, True) == ([False], False)
+        assert await rejoin(M.MODE_STRICT, True, mod=True) == ([False], False)
+
+    asyncio.run(run())
+    print("rejoin residual mute OK")
+
+
+def test_point_of_order_floor():
+    m = _agenda_meeting()
+    assert m.raise_point_of_order(7, "Ann")
+    _, turn = m.give_floor(7, "Ann")
+    assert turn.point_of_order and m.queue == []
+    # The speaker cannot queue a point of order behind themselves.
+    assert not m.raise_point_of_order(7, "Ann")
+    assert m.queue == []
+    _, plain = m.give_floor(8, "Bob")
+    assert not plain.point_of_order
+    print("point of order floor OK")
+
+
+def test_restart_voids_open_motions():
+    from merryn.meeting import Registry
+
+    with tempfile.TemporaryDirectory() as d:
+        reg = Registry(Path(d) / "state.json")
+        m = _agenda_meeting()
+        m.motions.append(MotionRecord(text="open one", moved_by="Ann"))
+        m.motions.append(MotionRecord(text="done", moved_by="Ann", outcome="carried"))
+        reg.meetings[m.guild_id] = m
+        reg.save()
+        loaded = Registry.load(Path(d) / "state.json")
+        assert loaded.void_open_motions() == 1
+        outcomes = [x.outcome for x in loaded.meetings[1].motions]
+        assert outcomes == ["void", "carried"], outcomes
+        assert loaded.void_open_motions() == 0
+    print("restart voids open motions OK")
+
+
 def test_update_is_newer():
     from merryn.update import is_newer
 
@@ -385,6 +525,10 @@ if __name__ == "__main__":
     test_agenda_edit_and_move()
     test_reminders_for_member()
     test_withdraw_and_mover()
+    test_second_and_failed_ballot_leave_no_trace()
+    test_restart_voids_open_motions()
+    test_point_of_order_floor()
+    test_rejoin_residual_mute()
     test_update_is_newer()
     test_version_single_sourced()
     print("all smoke tests passed")

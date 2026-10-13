@@ -194,7 +194,11 @@ class Meeting:
         return True
 
     def raise_point_of_order(self, user_id: int, display_name: str) -> bool:
-        """Returns True if newly raised/upgraded, False if already pending."""
+        """Returns True if newly raised/upgraded, False if already pending
+        or the member already holds the floor (queueing them behind
+        themselves would hand the floor straight back on the next call)."""
+        if self.current is not None and self.current.user_id == user_id:
+            return False
         existing = self.find_queued(user_id)
         if existing and existing.point_of_order:
             return False
@@ -238,7 +242,11 @@ class Meeting:
         entry = self.find_queued(user_id)
         if entry is not None:
             self.queue.remove(entry)
-        self.current = SpeakerTurn(user_id=user_id, display_name=display_name)
+        self.current = SpeakerTurn(
+            user_id=user_id,
+            display_name=display_name,
+            point_of_order=entry.point_of_order if entry is not None else False,
+        )
         self.timer_alerted = False
         return previous, self.current
 
@@ -430,6 +438,16 @@ class Registry:
 
     def get(self, guild_id: int) -> Meeting | None:
         return self.meetings.get(guild_id)
+
+    def void_open_motions(self) -> int:
+        """Marks every motion still open as void. Returns how many."""
+        count = 0
+        for meeting in self.meetings.values():
+            for motion in meeting.motions:
+                if motion.outcome == "open":
+                    motion.outcome = "void"
+                    count += 1
+        return count
 
     def save(self) -> None:
         payload = {

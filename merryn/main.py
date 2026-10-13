@@ -106,6 +106,10 @@ PANEL_TITLE = "Meeting in session"
 # than a couple of minutes risks missing the window on a slow tick.
 MEETING_REMINDER_LEAD_MINUTES = int(os.environ.get("MEETING_REMINDER_LEAD_MINUTES", "10"))
 
+# A /remind reminder that can reach neither the member's DMs nor its channel
+# is retried every minute, then dropped once it is this far overdue.
+PERSONAL_REMINDER_GIVE_UP = timedelta(hours=24)
+
 # Optional minutes archive: when a real (non-test) meeting ends, a summary
 # embed and the full Markdown minutes are also filed to this channel (found
 # by name, or by an explicit id via MINUTES_CHANNEL_ID), so the group keeps
@@ -216,7 +220,16 @@ class Merryn(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
         intents.members = True  # needed to see who is in the voice channel
-        super().__init__(intents=intents)
+        # Member-written text is echoed back all over (notes, decisions,
+        # agenda items, motions, reminders), so never let it ping @everyone,
+        # @here or a role. A send that genuinely needs one can pass its own
+        # allowed_mentions.
+        super().__init__(
+            intents=intents,
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False, roles=False, users=True, replied_user=True
+            ),
+        )
         self.tree = MerrynCommandTree(self)
         self.registry: Registry = Registry(DATA_DIR / "state.json")
         self.continuity: ContinuityStore = ContinuityStore(DATA_DIR / "continuity.json")
@@ -233,6 +246,12 @@ class Merryn(discord.Client):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         (DATA_DIR / "minutes").mkdir(exist_ok=True)
         self.registry = Registry.load(DATA_DIR / "state.json")
+        # Ballot views live only in memory, so a motion still open at
+        # shutdown has dead buttons and nothing tracking it. Void it now,
+        # as /meeting end would, so it neither misleads the chair nor
+        # lingers as open. (on_ready lifts its ballot mutes.)
+        if self.registry.void_open_motions():
+            self.registry.save()
         self.continuity = ContinuityStore.load(DATA_DIR / "continuity.json")
         self._update_notified = self._load_update_state()
         self.add_view(PanelView(self))
@@ -375,8 +394,10 @@ class Merryn(discord.Client):
             if reminder.fired:
                 continue
             if now >= start - timedelta(minutes=MEETING_REMINDER_LEAD_MINUTES):
-                await self._fire_meeting_reminder(guild_id, reminder, start)
-                self.continuity.mark_reminder_fired(guild_id, reminder.event_id)
+                # Only a reminder that actually went out counts; a failed one
+                # is retried next tick until the start time prunes it.
+                if await self._fire_meeting_reminder(guild_id, reminder, start):
+                    self.continuity.mark_reminder_fired(guild_id, reminder.event_id)
 
     @meeting_reminder_tick.before_loop
     async def _before_meeting_reminder_tick(self) -> None:
@@ -384,7 +405,8 @@ class Merryn(discord.Client):
 
     async def _fire_meeting_reminder(
         self, guild_id: int, reminder: PendingReminder, start: datetime
-    ) -> None:
+    ) -> bool:
+        """Returns True if the reminder was posted."""
         channel = self.get_channel(reminder.channel_id)
         if channel is None:
             log.warning(
@@ -392,27 +414,43 @@ class Merryn(discord.Client):
                 reminder.channel_id,
                 guild_id,
             )
-            return
+            return False
         try:
             await channel.send(
                 f"🔔 **{reminder.title}** starts <t:{int(start.timestamp())}:R>."
             )
         except discord.HTTPException as exc:
             log.warning("Meeting reminder send failed (guild=%s): %s", guild_id, exc)
+            return False
+        return True
 
     @tasks.loop(seconds=60)
     async def personal_reminder_tick(self) -> None:
         now = datetime.now(UTC)
         for reminder in list(self.continuity.personal_reminders):
-            if now >= iso_to_dt(reminder.fire_at):
-                await self._fire_personal_reminder(reminder)
+            fire_at = iso_to_dt(reminder.fire_at)
+            if now < fire_at:
+                continue
+            if await self._fire_personal_reminder(reminder):
+                self.continuity.pop_personal_reminder(reminder.id)
+            elif now - fire_at > PERSONAL_REMINDER_GIVE_UP:
+                # Retried every minute since it fell due; stop rather than
+                # retry for ever.
+                log.warning(
+                    "Personal reminder %s undeliverable for %s; dropped (user=%s)",
+                    reminder.id,
+                    PERSONAL_REMINDER_GIVE_UP,
+                    reminder.user_id,
+                )
                 self.continuity.pop_personal_reminder(reminder.id)
 
     @personal_reminder_tick.before_loop
     async def _before_personal_reminder_tick(self) -> None:
         await self.wait_until_ready()
 
-    async def _fire_personal_reminder(self, reminder: PersonalReminder) -> None:
+    async def _fire_personal_reminder(self, reminder: PersonalReminder) -> bool:
+        """Returns True once the reminder reached the member by DM or in
+        the channel it was set from."""
         message = f"⏰ Reminder: {reminder.text}"
         user = self.get_user(reminder.user_id)
         if user is None:
@@ -423,7 +461,7 @@ class Merryn(discord.Client):
         if user is not None:
             try:
                 await user.send(message)
-                return
+                return True
             except discord.HTTPException:
                 pass  # DMs closed or user unreachable — fall back below.
         channel = self.get_channel(reminder.channel_id)
@@ -433,13 +471,22 @@ class Merryn(discord.Client):
                 reminder.channel_id,
                 reminder.user_id,
             )
-            return
+            return False
         try:
-            await channel.send(f"⏰ <@{reminder.user_id}> — {reminder.text}")
+            await channel.send(
+                f"⏰ <@{reminder.user_id}> — {reminder.text}",
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False,
+                    roles=False,
+                    users=[discord.Object(id=reminder.user_id)],
+                ),
+            )
         except discord.HTTPException as exc:
             log.warning(
                 "Personal reminder send failed (user=%s): %s", reminder.user_id, exc
             )
+            return False
+        return True
 
     # --- panel -------------------------------------------------------------
 
@@ -595,11 +642,16 @@ class Merryn(discord.Client):
         guild = self.get_guild(meeting.guild_id)
         channel = guild.get_channel(meeting.text_channel_id) if guild else None
         if channel:
-            await channel.send(
-                f"⏰ **{meeting.current.display_name}** has reached the "
-                f"{fmt_duration(meeting.timer_seconds)} speaking limit. "
-                f"<@{meeting.started_by_id}>"
-            )
+            # An unhandled error here would stop panel_tick for good, taking
+            # the speaking limit and panel refresh down with it.
+            try:
+                await channel.send(
+                    f"⏰ **{meeting.current.display_name}** has reached the "
+                    f"{fmt_duration(meeting.timer_seconds)} speaking limit. "
+                    f"<@{meeting.started_by_id}>"
+                )
+            except discord.HTTPException as exc:
+                log.warning("Speaker timer alert failed: %s", exc)
 
     # --- muting ------------------------------------------------------------
 
@@ -680,26 +732,35 @@ class Merryn(discord.Client):
 
         if now_in and not was_in:
             meeting.record_attendance(member.id, member.display_name, "join")
-            if residual:
-                residual.discard(member.id)
-            if (
+            strict_mutes = (
                 meeting.mode == MODE_STRICT
                 and not is_moderator(member)
                 and not (meeting.current and meeting.current.user_id == member.id)
-            ):
+            )
+            open_ballot = self._open_ballots.get(guild_id)
+            # The chamber is voting: joiners are muted like everyone else.
+            ballot_mutes = open_ballot is not None and not open_ballot.is_finished()
+            if strict_mutes:
                 if await self.try_set_mute(member, True):
                     if member.id not in meeting.muted_user_ids:
                         meeting.muted_user_ids.append(member.id)
-            open_ballot = self._open_ballots.get(guild_id)
-            if (
-                open_ballot is not None
-                and not open_ballot.is_finished()
-                and member.id not in meeting.muted_user_ids
-            ):
-                # The chamber is voting: joiners are muted like everyone else.
+            if ballot_mutes and member.id not in meeting.muted_user_ids:
                 if await self.try_set_mute(member, True):
                     if member.id not in meeting.ballot_muted_user_ids:
                         meeting.ballot_muted_user_ids.append(member.id)
+            if residual and member.id in residual:
+                # A mute left over from an earlier session. Where strict mode
+                # or a ballot wants them muted, never lift it: drop the ledger
+                # entry only once the meeting is tracking the mute itself.
+                # Otherwise lift it, keeping the entry until Discord accepts.
+                if strict_mutes or ballot_mutes:
+                    if (
+                        member.id in meeting.muted_user_ids
+                        or member.id in meeting.ballot_muted_user_ids
+                    ):
+                        residual.discard(member.id)
+                elif await self.try_set_mute(member, False):
+                    residual.discard(member.id)
             self.registry.save()
             await self.refresh_panel(meeting)
 
@@ -785,6 +846,11 @@ class Merryn(discord.Client):
         if not in_meeting_voice(member, meeting):
             await interaction.response.send_message(
                 "Join the meeting voice channel first.", ephemeral=True
+            )
+            return
+        if meeting.current and meeting.current.user_id == member.id:
+            await interaction.response.send_message(
+                "You already hold the floor.", ephemeral=True
             )
             return
         if not meeting.raise_point_of_order(member.id, member.display_name):
@@ -1468,7 +1534,13 @@ class Merryn(discord.Client):
         override: bool = False,
         seconded_by: str | None = None,
         mover: discord.Member | None = None,
-    ) -> None:
+    ) -> bool:
+        """Opens a ballot. Returns True once it is posted, False if refused
+        (the refusal has already been sent to the interaction).
+
+        Nothing is written to the minutes until the ballot message is up,
+        so a failed send leaves no open motion behind.
+        """
         # The mover is not always the interaction's user: a motion awaiting
         # a second opens from the seconder's button press. Permission checks
         # and the record must follow the mover, not whoever pressed it.
@@ -1478,7 +1550,7 @@ class Merryn(discord.Client):
             await interaction.response.send_message(
                 "A ballot is already open — one motion at a time.", ephemeral=True
             )
-            return
+            return False
 
         present = self._eligible_voter_count(
             interaction.guild, meeting.voice_channel_id
@@ -1496,20 +1568,14 @@ class Merryn(discord.Client):
                     f"it is recorded in the minutes.",
                     ephemeral=True,
                 )
-                return
+                return False
             if not is_moderator(mover):
                 await interaction.response.send_message(
                     "Only a moderator may force a ballot in an inquorate chamber.",
                     ephemeral=True,
                 )
-                return
+                return False
             override_used = True
-            meeting.add_log(
-                "procedural",
-                f"Ballot on “{text}” forced by chair override — {present} present, "
-                f"{meeting.quorum_size} required for a quorum.",
-                mover.display_name,
-            )
 
         record = MotionRecord(
             text=text,
@@ -1520,9 +1586,6 @@ class Merryn(discord.Client):
             quorum_override=override_used,
             seconded_by=seconded_by,
         )
-        meeting.motions.append(record)
-        self.registry.save()
-
         view = MotionView(self, meeting.voice_channel_id)
         view.record = record
         view.guild_id = interaction.guild_id
@@ -1532,6 +1595,15 @@ class Merryn(discord.Client):
         )
         view.message = await interaction.original_response()
         self._open_ballots[interaction.guild_id] = view
+        if override_used:
+            meeting.add_log(
+                "procedural",
+                f"Ballot on “{text}” forced by chair override — {present} present, "
+                f"{meeting.quorum_size} required for a quorum.",
+                mover.display_name,
+            )
+        meeting.motions.append(record)
+        self.registry.save()
 
         task = asyncio.create_task(self._close_motion_later(view, seconds))
         view.close_task = task
@@ -1541,6 +1613,7 @@ class Merryn(discord.Client):
         )
 
         await self._start_ballot_ambience(meeting, interaction.guild)
+        return True
 
     async def handle_second_motion(
         self, interaction: discord.Interaction, view: SecondView
@@ -1551,7 +1624,7 @@ class Merryn(discord.Client):
         had been named inline on /motion — the ballot that results is
         indistinguishable either way.
         """
-        if view.is_finished():
+        if view.is_finished() or view.seconding:
             await interaction.response.send_message(
                 "This motion has already been dealt with.", ephemeral=True
             )
@@ -1584,6 +1657,25 @@ class Merryn(discord.Client):
             )
             return
 
+        # Only retire the Second button once a ballot is actually up: if
+        # open_motion refuses (a ballot already open, an inquorate chamber)
+        # the motion stays open for a second later.
+        view.seconding = True
+        try:
+            opened = await self.open_motion(
+                interaction,
+                meeting,
+                view.motion_text,
+                view.motion_seconds,
+                view.pass_threshold,
+                override=view.override,
+                seconded_by=member.display_name,
+                mover=mover,
+            )
+        finally:
+            view.seconding = False
+        if not opened:
+            return
         view.stop()
         if view.message is not None:
             try:
@@ -1592,17 +1684,6 @@ class Merryn(discord.Client):
                 )
             except discord.HTTPException:
                 pass
-
-        await self.open_motion(
-            interaction,
-            meeting,
-            view.motion_text,
-            view.motion_seconds,
-            view.pass_threshold,
-            override=view.override,
-            seconded_by=member.display_name,
-            mover=mover,
-        )
 
     async def update_ballot_tally(
         self, guild: discord.Guild, view: MotionView
