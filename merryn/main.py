@@ -680,8 +680,6 @@ class Merryn(discord.Client):
 
         if now_in and not was_in:
             meeting.record_attendance(member.id, member.display_name, "join")
-            if residual:
-                residual.discard(member.id)
             if (
                 meeting.mode == MODE_STRICT
                 and not is_moderator(member)
@@ -700,6 +698,17 @@ class Merryn(discord.Client):
                 if await self.try_set_mute(member, True):
                     if member.id not in meeting.ballot_muted_user_ids:
                         meeting.ballot_muted_user_ids.append(member.id)
+            if residual and member.id in residual:
+                # A mute left over from an earlier session. If strict mode or
+                # an open ballot has just re-muted them, the meeting tracks it
+                # now; otherwise lift it, keeping them on the ledger until
+                # Discord accepts the unmute.
+                if (
+                    member.id in meeting.muted_user_ids
+                    or member.id in meeting.ballot_muted_user_ids
+                    or await self.try_set_mute(member, False)
+                ):
+                    residual.discard(member.id)
             self.registry.save()
             await self.refresh_panel(meeting)
 
