@@ -431,6 +431,16 @@ class Registry:
     def get(self, guild_id: int) -> Meeting | None:
         return self.meetings.get(guild_id)
 
+    def void_open_motions(self) -> int:
+        """Marks every motion still open as void. Returns how many."""
+        count = 0
+        for meeting in self.meetings.values():
+            for motion in meeting.motions:
+                if motion.outcome == "open":
+                    motion.outcome = "void"
+                    count += 1
+        return count
+
     def save(self) -> None:
         payload = {
             "meetings": {str(gid): m.to_dict() for gid, m in self.meetings.items()},

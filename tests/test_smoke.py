@@ -347,6 +347,24 @@ def test_withdraw_and_mover():
     print("withdraw and mover OK")
 
 
+def test_restart_voids_open_motions():
+    from merryn.meeting import Registry
+
+    with tempfile.TemporaryDirectory() as d:
+        reg = Registry(Path(d) / "state.json")
+        m = _agenda_meeting()
+        m.motions.append(MotionRecord(text="open one", moved_by="Ann"))
+        m.motions.append(MotionRecord(text="done", moved_by="Ann", outcome="carried"))
+        reg.meetings[m.guild_id] = m
+        reg.save()
+        loaded = Registry.load(Path(d) / "state.json")
+        assert loaded.void_open_motions() == 1
+        outcomes = [x.outcome for x in loaded.meetings[1].motions]
+        assert outcomes == ["void", "carried"], outcomes
+        assert loaded.void_open_motions() == 0
+    print("restart voids open motions OK")
+
+
 def test_update_is_newer():
     from merryn.update import is_newer
 
@@ -385,6 +403,7 @@ if __name__ == "__main__":
     test_agenda_edit_and_move()
     test_reminders_for_member()
     test_withdraw_and_mover()
+    test_restart_voids_open_motions()
     test_update_is_newer()
     test_version_single_sourced()
     print("all smoke tests passed")

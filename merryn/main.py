@@ -233,6 +233,12 @@ class Merryn(discord.Client):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         (DATA_DIR / "minutes").mkdir(exist_ok=True)
         self.registry = Registry.load(DATA_DIR / "state.json")
+        # Ballot views live only in memory, so a motion still open at
+        # shutdown has dead buttons and nothing tracking it. Void it now,
+        # as /meeting end would, so it neither misleads the chair nor
+        # lingers as open. (on_ready lifts its ballot mutes.)
+        if self.registry.void_open_motions():
+            self.registry.save()
         self.continuity = ContinuityStore.load(DATA_DIR / "continuity.json")
         self._update_notified = self._load_update_state()
         self.add_view(PanelView(self))
