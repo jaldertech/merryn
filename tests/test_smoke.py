@@ -403,6 +403,59 @@ def test_second_and_failed_ballot_leave_no_trace():
     print("second refusal and failed ballot OK")
 
 
+def test_rejoin_residual_mute():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from merryn import main as M
+    from merryn.meeting import Registry
+
+    async def rejoin(mode, remute_ok, ballot=False, mod=False):
+        bot = M.client
+        with tempfile.TemporaryDirectory() as d:
+            reg = Registry(Path(d) / "state.json")
+        reg.save = lambda: None
+        mtg = _agenda_meeting()
+        mtg.mode = mode
+        reg.meetings[1] = mtg
+        reg.residual_mutes[1] = {7}
+        bot._open_ballots.clear()
+        if ballot:
+            open_view = MagicMock()
+            open_view.is_finished.return_value = False
+            bot._open_ballots[1] = open_view
+        member = MagicMock()
+        member.bot, member.id, member.guild.id = False, 7, 1
+        before, after = MagicMock(), MagicMock()
+        before.channel, after.channel.id = None, 5
+        calls = []
+
+        async def set_mute(_m, mute):
+            calls.append(mute)
+            return remute_ok if mute else True
+
+        with patch.object(bot, "registry", reg), \
+             patch.object(bot, "try_set_mute", side_effect=set_mute), \
+             patch.object(M, "is_moderator", return_value=mod), \
+             patch.object(bot, "refresh_panel", AsyncMock()):
+            await bot.on_voice_state_update(member, before, after)
+        bot._open_ballots.clear()
+        return calls, 7 in reg.residual_mutes[1]
+
+    async def run():
+        # Strict or mid-ballot: never unmuted, even if the re-mute fails;
+        # the ledger keeps them until the meeting tracks the mute itself.
+        assert await rejoin(M.MODE_STRICT, False) == ([True], True)
+        assert await rejoin(M.MODE_STRICT, True) == ([True], False)
+        assert await rejoin(M.MODE_ADVISORY, False, ballot=True) == ([True], True)
+        # Nothing wants them muted: the leftover mute is lifted.
+        assert await rejoin(M.MODE_ADVISORY, True) == ([False], False)
+        assert await rejoin(M.MODE_STRICT, True, mod=True) == ([False], False)
+
+    asyncio.run(run())
+    print("rejoin residual mute OK")
+
+
 def test_point_of_order_floor():
     m = _agenda_meeting()
     assert m.raise_point_of_order(7, "Ann")
@@ -475,6 +528,7 @@ if __name__ == "__main__":
     test_second_and_failed_ballot_leave_no_trace()
     test_restart_voids_open_motions()
     test_point_of_order_floor()
+    test_rejoin_residual_mute()
     test_update_is_newer()
     test_version_single_sourced()
     print("all smoke tests passed")

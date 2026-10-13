@@ -732,34 +732,34 @@ class Merryn(discord.Client):
 
         if now_in and not was_in:
             meeting.record_attendance(member.id, member.display_name, "join")
-            if (
+            strict_mutes = (
                 meeting.mode == MODE_STRICT
                 and not is_moderator(member)
                 and not (meeting.current and meeting.current.user_id == member.id)
-            ):
+            )
+            open_ballot = self._open_ballots.get(guild_id)
+            # The chamber is voting: joiners are muted like everyone else.
+            ballot_mutes = open_ballot is not None and not open_ballot.is_finished()
+            if strict_mutes:
                 if await self.try_set_mute(member, True):
                     if member.id not in meeting.muted_user_ids:
                         meeting.muted_user_ids.append(member.id)
-            open_ballot = self._open_ballots.get(guild_id)
-            if (
-                open_ballot is not None
-                and not open_ballot.is_finished()
-                and member.id not in meeting.muted_user_ids
-            ):
-                # The chamber is voting: joiners are muted like everyone else.
+            if ballot_mutes and member.id not in meeting.muted_user_ids:
                 if await self.try_set_mute(member, True):
                     if member.id not in meeting.ballot_muted_user_ids:
                         meeting.ballot_muted_user_ids.append(member.id)
             if residual and member.id in residual:
-                # A mute left over from an earlier session. If strict mode or
-                # an open ballot has just re-muted them, the meeting tracks it
-                # now; otherwise lift it, keeping them on the ledger until
-                # Discord accepts the unmute.
-                if (
-                    member.id in meeting.muted_user_ids
-                    or member.id in meeting.ballot_muted_user_ids
-                    or await self.try_set_mute(member, False)
-                ):
+                # A mute left over from an earlier session. Where strict mode
+                # or a ballot wants them muted, never lift it: drop the ledger
+                # entry only once the meeting is tracking the mute itself.
+                # Otherwise lift it, keeping the entry until Discord accepts.
+                if strict_mutes or ballot_mutes:
+                    if (
+                        member.id in meeting.muted_user_ids
+                        or member.id in meeting.ballot_muted_user_ids
+                    ):
+                        residual.discard(member.id)
+                elif await self.try_set_mute(member, False):
                     residual.discard(member.id)
             self.registry.save()
             await self.refresh_panel(meeting)
