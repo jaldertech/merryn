@@ -106,6 +106,10 @@ PANEL_TITLE = "Meeting in session"
 # than a couple of minutes risks missing the window on a slow tick.
 MEETING_REMINDER_LEAD_MINUTES = int(os.environ.get("MEETING_REMINDER_LEAD_MINUTES", "10"))
 
+# A /remind reminder that can reach neither the member's DMs nor its channel
+# is retried every minute, then dropped once it is this far overdue.
+PERSONAL_REMINDER_GIVE_UP = timedelta(hours=24)
+
 # Optional minutes archive: when a real (non-test) meeting ends, a summary
 # embed and the full Markdown minutes are also filed to this channel (found
 # by name, or by an explicit id via MINUTES_CHANNEL_ID), so the group keeps
@@ -390,8 +394,10 @@ class Merryn(discord.Client):
             if reminder.fired:
                 continue
             if now >= start - timedelta(minutes=MEETING_REMINDER_LEAD_MINUTES):
-                await self._fire_meeting_reminder(guild_id, reminder, start)
-                self.continuity.mark_reminder_fired(guild_id, reminder.event_id)
+                # Only a reminder that actually went out counts; a failed one
+                # is retried next tick until the start time prunes it.
+                if await self._fire_meeting_reminder(guild_id, reminder, start):
+                    self.continuity.mark_reminder_fired(guild_id, reminder.event_id)
 
     @meeting_reminder_tick.before_loop
     async def _before_meeting_reminder_tick(self) -> None:
@@ -399,7 +405,8 @@ class Merryn(discord.Client):
 
     async def _fire_meeting_reminder(
         self, guild_id: int, reminder: PendingReminder, start: datetime
-    ) -> None:
+    ) -> bool:
+        """Returns True if the reminder was posted."""
         channel = self.get_channel(reminder.channel_id)
         if channel is None:
             log.warning(
@@ -407,27 +414,43 @@ class Merryn(discord.Client):
                 reminder.channel_id,
                 guild_id,
             )
-            return
+            return False
         try:
             await channel.send(
                 f"🔔 **{reminder.title}** starts <t:{int(start.timestamp())}:R>."
             )
         except discord.HTTPException as exc:
             log.warning("Meeting reminder send failed (guild=%s): %s", guild_id, exc)
+            return False
+        return True
 
     @tasks.loop(seconds=60)
     async def personal_reminder_tick(self) -> None:
         now = datetime.now(UTC)
         for reminder in list(self.continuity.personal_reminders):
-            if now >= iso_to_dt(reminder.fire_at):
-                await self._fire_personal_reminder(reminder)
+            fire_at = iso_to_dt(reminder.fire_at)
+            if now < fire_at:
+                continue
+            if await self._fire_personal_reminder(reminder):
+                self.continuity.pop_personal_reminder(reminder.id)
+            elif now - fire_at > PERSONAL_REMINDER_GIVE_UP:
+                # Retried every minute since it fell due; stop rather than
+                # retry for ever.
+                log.warning(
+                    "Personal reminder %s undeliverable for %s; dropped (user=%s)",
+                    reminder.id,
+                    PERSONAL_REMINDER_GIVE_UP,
+                    reminder.user_id,
+                )
                 self.continuity.pop_personal_reminder(reminder.id)
 
     @personal_reminder_tick.before_loop
     async def _before_personal_reminder_tick(self) -> None:
         await self.wait_until_ready()
 
-    async def _fire_personal_reminder(self, reminder: PersonalReminder) -> None:
+    async def _fire_personal_reminder(self, reminder: PersonalReminder) -> bool:
+        """Returns True once the reminder reached the member by DM or in
+        the channel it was set from."""
         message = f"⏰ Reminder: {reminder.text}"
         user = self.get_user(reminder.user_id)
         if user is None:
@@ -438,7 +461,7 @@ class Merryn(discord.Client):
         if user is not None:
             try:
                 await user.send(message)
-                return
+                return True
             except discord.HTTPException:
                 pass  # DMs closed or user unreachable — fall back below.
         channel = self.get_channel(reminder.channel_id)
@@ -448,13 +471,22 @@ class Merryn(discord.Client):
                 reminder.channel_id,
                 reminder.user_id,
             )
-            return
+            return False
         try:
-            await channel.send(f"⏰ <@{reminder.user_id}> — {reminder.text}")
+            await channel.send(
+                f"⏰ <@{reminder.user_id}> — {reminder.text}",
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False,
+                    roles=False,
+                    users=[discord.Object(id=reminder.user_id)],
+                ),
+            )
         except discord.HTTPException as exc:
             log.warning(
                 "Personal reminder send failed (user=%s): %s", reminder.user_id, exc
             )
+            return False
+        return True
 
     # --- panel -------------------------------------------------------------
 
