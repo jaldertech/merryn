@@ -347,6 +347,62 @@ def test_withdraw_and_mover():
     print("withdraw and mover OK")
 
 
+def test_second_and_failed_ballot_leave_no_trace():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    import discord
+
+    from merryn import main as M
+
+    async def run():
+        bot = M.client
+        mtg = _agenda_meeting()
+
+        # A second pressed while another ballot is open is refused, and the
+        # Second button stays live for later.
+        busy = MagicMock()
+        busy.is_finished.return_value = False
+        bot._open_ballots[1] = busy
+        view = MagicMock()
+        view.is_finished.return_value = False
+        view.seconding = False
+        view.voice_channel_id, view.mover_id = 5, 1
+        view.motion_text, view.motion_seconds = "Buy a goat", 60
+        view.pass_threshold, view.override = None, False
+        view.message.edit = AsyncMock()
+        seconder = MagicMock()
+        seconder.id, seconder.display_name = 2, "u2"
+        seconder.voice.channel.id = 5
+        inter = MagicMock()
+        inter.user, inter.guild_id = seconder, 1
+        inter.response.send_message = AsyncMock()
+        with patch.object(bot.registry, "get", return_value=mtg):
+            await bot.handle_second_motion(inter, view)
+        view.stop.assert_not_called()
+        view.message.edit.assert_not_called()
+        assert not view.seconding and mtg.motions == []
+
+        # A ballot whose post fails leaves no open motion in the minutes.
+        bot._open_ballots.clear()
+        inter = MagicMock()
+        inter.user, inter.guild_id = seconder, 1
+        inter.response.send_message = AsyncMock(
+            side_effect=discord.HTTPException(MagicMock(status=500), "boom")
+        )
+        with patch.object(bot, "_eligible_voter_count", return_value=3), \
+             patch.object(bot, "build_ballot_embed", return_value=None), \
+             patch.object(bot.registry, "save"):
+            try:
+                await bot.open_motion(inter, mtg, "Buy a goat", 60)
+            except discord.HTTPException:
+                pass
+        assert mtg.motions == [] and 1 not in bot._open_ballots
+
+    asyncio.run(run())
+    print("second refusal and failed ballot OK")
+
+
 def test_restart_voids_open_motions():
     from merryn.meeting import Registry
 
@@ -403,6 +459,7 @@ if __name__ == "__main__":
     test_agenda_edit_and_move()
     test_reminders_for_member()
     test_withdraw_and_mover()
+    test_second_and_failed_ballot_leave_no_trace()
     test_restart_voids_open_motions()
     test_update_is_newer()
     test_version_single_sourced()

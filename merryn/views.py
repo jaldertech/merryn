@@ -134,6 +134,9 @@ class SecondView(discord.ui.View):
         self.pass_threshold = pass_threshold
         self.override = override
         self.message: discord.Message | None = None
+        # Set while a second is being turned into a ballot, so a second
+        # press in the meantime cannot open a duplicate.
+        self.seconding = False
 
     @discord.ui.button(label="Second this motion", emoji="🤝", style=discord.ButtonStyle.primary)
     async def second(self, interaction: discord.Interaction, button: discord.ui.Button):

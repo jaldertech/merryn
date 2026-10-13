@@ -1488,7 +1488,13 @@ class Merryn(discord.Client):
         override: bool = False,
         seconded_by: str | None = None,
         mover: discord.Member | None = None,
-    ) -> None:
+    ) -> bool:
+        """Opens a ballot. Returns True once it is posted, False if refused
+        (the refusal has already been sent to the interaction).
+
+        Nothing is written to the minutes until the ballot message is up,
+        so a failed send leaves no open motion behind.
+        """
         # The mover is not always the interaction's user: a motion awaiting
         # a second opens from the seconder's button press. Permission checks
         # and the record must follow the mover, not whoever pressed it.
@@ -1498,7 +1504,7 @@ class Merryn(discord.Client):
             await interaction.response.send_message(
                 "A ballot is already open — one motion at a time.", ephemeral=True
             )
-            return
+            return False
 
         present = self._eligible_voter_count(
             interaction.guild, meeting.voice_channel_id
@@ -1516,20 +1522,14 @@ class Merryn(discord.Client):
                     f"it is recorded in the minutes.",
                     ephemeral=True,
                 )
-                return
+                return False
             if not is_moderator(mover):
                 await interaction.response.send_message(
                     "Only a moderator may force a ballot in an inquorate chamber.",
                     ephemeral=True,
                 )
-                return
+                return False
             override_used = True
-            meeting.add_log(
-                "procedural",
-                f"Ballot on “{text}” forced by chair override — {present} present, "
-                f"{meeting.quorum_size} required for a quorum.",
-                mover.display_name,
-            )
 
         record = MotionRecord(
             text=text,
@@ -1540,9 +1540,6 @@ class Merryn(discord.Client):
             quorum_override=override_used,
             seconded_by=seconded_by,
         )
-        meeting.motions.append(record)
-        self.registry.save()
-
         view = MotionView(self, meeting.voice_channel_id)
         view.record = record
         view.guild_id = interaction.guild_id
@@ -1552,6 +1549,15 @@ class Merryn(discord.Client):
         )
         view.message = await interaction.original_response()
         self._open_ballots[interaction.guild_id] = view
+        if override_used:
+            meeting.add_log(
+                "procedural",
+                f"Ballot on “{text}” forced by chair override — {present} present, "
+                f"{meeting.quorum_size} required for a quorum.",
+                mover.display_name,
+            )
+        meeting.motions.append(record)
+        self.registry.save()
 
         task = asyncio.create_task(self._close_motion_later(view, seconds))
         view.close_task = task
@@ -1561,6 +1567,7 @@ class Merryn(discord.Client):
         )
 
         await self._start_ballot_ambience(meeting, interaction.guild)
+        return True
 
     async def handle_second_motion(
         self, interaction: discord.Interaction, view: SecondView
@@ -1571,7 +1578,7 @@ class Merryn(discord.Client):
         had been named inline on /motion — the ballot that results is
         indistinguishable either way.
         """
-        if view.is_finished():
+        if view.is_finished() or view.seconding:
             await interaction.response.send_message(
                 "This motion has already been dealt with.", ephemeral=True
             )
@@ -1604,6 +1611,25 @@ class Merryn(discord.Client):
             )
             return
 
+        # Only retire the Second button once a ballot is actually up: if
+        # open_motion refuses (a ballot already open, an inquorate chamber)
+        # the motion stays open for a second later.
+        view.seconding = True
+        try:
+            opened = await self.open_motion(
+                interaction,
+                meeting,
+                view.motion_text,
+                view.motion_seconds,
+                view.pass_threshold,
+                override=view.override,
+                seconded_by=member.display_name,
+                mover=mover,
+            )
+        finally:
+            view.seconding = False
+        if not opened:
+            return
         view.stop()
         if view.message is not None:
             try:
@@ -1612,17 +1638,6 @@ class Merryn(discord.Client):
                 )
             except discord.HTTPException:
                 pass
-
-        await self.open_motion(
-            interaction,
-            meeting,
-            view.motion_text,
-            view.motion_seconds,
-            view.pass_threshold,
-            override=view.override,
-            seconded_by=member.display_name,
-            mover=mover,
-        )
 
     async def update_ballot_tally(
         self, guild: discord.Guild, view: MotionView
