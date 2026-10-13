@@ -601,11 +601,16 @@ class Merryn(discord.Client):
         guild = self.get_guild(meeting.guild_id)
         channel = guild.get_channel(meeting.text_channel_id) if guild else None
         if channel:
-            await channel.send(
-                f"⏰ **{meeting.current.display_name}** has reached the "
-                f"{fmt_duration(meeting.timer_seconds)} speaking limit. "
-                f"<@{meeting.started_by_id}>"
-            )
+            # An unhandled error here would stop panel_tick for good, taking
+            # the speaking limit and panel refresh down with it.
+            try:
+                await channel.send(
+                    f"⏰ **{meeting.current.display_name}** has reached the "
+                    f"{fmt_duration(meeting.timer_seconds)} speaking limit. "
+                    f"<@{meeting.started_by_id}>"
+                )
+            except discord.HTTPException as exc:
+                log.warning("Speaker timer alert failed: %s", exc)
 
     # --- muting ------------------------------------------------------------
 
