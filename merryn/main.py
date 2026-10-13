@@ -750,15 +750,24 @@ class Merryn(discord.Client):
                         meeting.ballot_muted_user_ids.append(member.id)
             if residual and member.id in residual:
                 # A mute left over from an earlier session. Where strict mode
-                # or a ballot wants them muted, never lift it: drop the ledger
-                # entry only once the meeting is tracking the mute itself.
+                # or a ballot wants them muted, never lift it. If the re-mute
+                # above failed but the old mute still holds, adopt it into the
+                # meeting's own list so it is lifted with everyone else's when
+                # the ballot closes, the mode changes or the meeting ends.
                 # Otherwise lift it, keeping the entry until Discord accepts.
                 if strict_mutes or ballot_mutes:
-                    if (
+                    tracked = (
                         member.id in meeting.muted_user_ids
                         or member.id in meeting.ballot_muted_user_ids
-                    ):
-                        residual.discard(member.id)
+                    )
+                    if not tracked and member.voice and member.voice.mute:
+                        adopt_into = (
+                            meeting.muted_user_ids
+                            if strict_mutes
+                            else meeting.ballot_muted_user_ids
+                        )
+                        adopt_into.append(member.id)
+                    residual.discard(member.id)
                 elif await self.try_set_mute(member, False):
                     residual.discard(member.id)
             self.registry.save()

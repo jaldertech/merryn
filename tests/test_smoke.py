@@ -410,7 +410,7 @@ def test_rejoin_residual_mute():
     from merryn import main as M
     from merryn.meeting import Registry
 
-    async def rejoin(mode, remute_ok, ballot=False, mod=False):
+    async def rejoin(mode, remute_ok, ballot=False, mod=False, still_muted=True):
         bot = M.client
         with tempfile.TemporaryDirectory() as d:
             reg = Registry(Path(d) / "state.json")
@@ -426,6 +426,7 @@ def test_rejoin_residual_mute():
             bot._open_ballots[1] = open_view
         member = MagicMock()
         member.bot, member.id, member.guild.id = False, 7, 1
+        member.voice.mute = still_muted
         before, after = MagicMock(), MagicMock()
         before.channel, after.channel.id = None, 5
         calls = []
@@ -440,17 +441,19 @@ def test_rejoin_residual_mute():
              patch.object(bot, "refresh_panel", AsyncMock()):
             await bot.on_voice_state_update(member, before, after)
         bot._open_ballots.clear()
-        return calls, 7 in reg.residual_mutes[1]
+        tracked = 7 in mtg.muted_user_ids or 7 in mtg.ballot_muted_user_ids
+        return calls, 7 in reg.residual_mutes[1], tracked
 
     async def run():
-        # Strict or mid-ballot: never unmuted, even if the re-mute fails;
-        # the ledger keeps them until the meeting tracks the mute itself.
-        assert await rejoin(M.MODE_STRICT, False) == ([True], True)
-        assert await rejoin(M.MODE_STRICT, True) == ([True], False)
-        assert await rejoin(M.MODE_ADVISORY, False, ballot=True) == ([True], True)
+        # Strict or mid-ballot: never unmuted. If the re-mute fails but the
+        # old mute holds, the meeting adopts it so it is lifted later.
+        assert await rejoin(M.MODE_STRICT, False) == ([True], False, True)
+        assert await rejoin(M.MODE_STRICT, True) == ([True], False, True)
+        assert await rejoin(M.MODE_ADVISORY, False, ballot=True) == ([True], False, True)
+        assert await rejoin(M.MODE_STRICT, False, still_muted=False) == ([True], False, False)
         # Nothing wants them muted: the leftover mute is lifted.
-        assert await rejoin(M.MODE_ADVISORY, True) == ([False], False)
-        assert await rejoin(M.MODE_STRICT, True, mod=True) == ([False], False)
+        assert await rejoin(M.MODE_ADVISORY, True) == ([False], False, False)
+        assert await rejoin(M.MODE_STRICT, True, mod=True) == ([False], False, False)
 
     asyncio.run(run())
     print("rejoin residual mute OK")
